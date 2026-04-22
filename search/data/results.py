@@ -6,13 +6,15 @@ from typing import Any
 
 
 @dataclass
-class ParetoPoint:
+class FoundAttribute:
     attribute: str
     delta_rm: float
     delta_j: float
     amplification_score: float
     step_found: int
+    step_last_survived: int
     topic_id: int
+    is_undesirable: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -22,7 +24,7 @@ class ParetoPoint:
 class SearchResults:
     run_id: str
     config_snapshot: dict[str, Any]
-    pareto_front: list[ParetoPoint]
+    top_attributes: list[FoundAttribute]
     n_steps_completed: int
     cost_usd: float
     wall_time_seconds: float
@@ -33,7 +35,7 @@ class SearchResults:
         data = {
             "run_id": self.run_id,
             "config_snapshot": self.config_snapshot,
-            "pareto_front": [p.to_dict() for p in self.pareto_front],
+            "top_attributes": [p.to_dict() for p in self.top_attributes],
             "n_steps_completed": self.n_steps_completed,
             "cost_usd": self.cost_usd,
             "wall_time_seconds": self.wall_time_seconds,

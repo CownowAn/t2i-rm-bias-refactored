@@ -9,12 +9,12 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from search.data.results import SearchResults, ParetoPoint
+from search.data.results import SearchResults, FoundAttribute
 from search.data.state import TopicState
 from search.pipeline.baselines import load_topic_states, load_baselines_from_manifest, score_baselines
 from search.pipeline.evaluator import CounterfactualEvaluator
 from search.pipeline.scoring import AmplificationScorer
-from search.pipeline.selector import ParetoSelector
+from search.pipeline.selector import TopKSelector
 from search.planner.cluster import AttributeClusterer
 from search.planner.initial import InitialPlanner
 from search.planner.mutator import AttributeMutator
@@ -22,7 +22,7 @@ from search.planner.mutator import AttributeMutator
 if TYPE_CHECKING:
     from search.config import SearchConfig
     from search.logging.tracker import ExperimentTracker
-    from search.models.base import RewardModel, JudgeModel
+    from search.models.base import RewardModel, JudgeModel, DetectorModel
 
 
 class EvolutionEngine:
@@ -34,29 +34,29 @@ class EvolutionEngine:
         topic_states: list[TopicState],
         reward_model: "RewardModel",
         judge_model: "JudgeModel",
+        detector_model: "DetectorModel",
         evaluator: CounterfactualEvaluator,
         amp_scorer: AmplificationScorer,
         initial_planner: InitialPlanner,
         mutator: AttributeMutator,
         clusterer: AttributeClusterer,
-        selector: ParetoSelector,
         tracker: "ExperimentTracker",
     ):
         self.config = config
         self.topic_states = topic_states
         self.reward_model = reward_model
         self.judge_model = judge_model
+        self.detector_model = detector_model
         self.evaluator = evaluator
         self.amp_scorer = amp_scorer
         self.initial_planner = initial_planner
         self.mutator = mutator
         self.clusterer = clusterer
-        self.selector = selector
         self.tracker = tracker
 
         self._rng = Random(config.run.random_seed)
         self._total_cost_usd = 0.0
-        self._all_pareto_points: list[ParetoPoint] = []
+        self._all_found: dict[tuple[str, int], FoundAttribute] = {}
 
     # ─── Factory ──────────────────────────────────────────────────────────────
 
@@ -67,7 +67,7 @@ class EvolutionEngine:
         tracker: "ExperimentTracker",
     ) -> "EvolutionEngine":
         from search.models.reward.imagereward import ImageRewardModel
-        from search.models.judge.vlm_judge import VisionLLMJudge
+        from search.models.judge.vlm_judge import VisionLLMJudge, VisionLLMDetector
         from search.models.editor.instruction_gen import EditInstructionGenerator
         from search.models.editor.flux_kontext import FluxKontextApplier
         from search.utils.async_utils import GpuApplierPool
@@ -81,6 +81,12 @@ class EvolutionEngine:
             model_name=config.models.judge.model,
             max_tokens=config.models.judge.max_tokens,
             max_parallel=config.models.judge.max_parallel,
+        )
+
+        detector_model = VisionLLMDetector(
+            model_name=config.models.detector.model,
+            max_tokens=config.models.detector.max_tokens,
+            max_parallel=config.models.detector.max_parallel,
         )
 
         instruction_gen = EditInstructionGenerator(
@@ -105,7 +111,7 @@ class EvolutionEngine:
             reward_model=reward_model,
             output_dir=output_dir,
         )
-        amp_scorer = AmplificationScorer(detector=judge_model)
+        amp_scorer = AmplificationScorer(detector=detector_model)
 
         initial_planner = InitialPlanner(
             model_name=config.models.planner.model,
@@ -115,6 +121,9 @@ class EvolutionEngine:
             n_attrs_per_prompt=config.evolution.n_attrs_per_prompt,
             n_per_user_prompt=config.evolution.n_per_user_prompt,
             n_context_imgs=config.evolution.n_context_imgs,
+            n_initial_plan_prompts=config.evolution.n_initial_plan_prompts,
+            initial_context_sampling=config.evolution.initial_context_sampling,
+            use_cluster_summary=config.evolution.use_cluster_summary,
             direction=config.evolution.direction,
             order=config.evolution.image_order,
             random_seed=config.run.random_seed,
@@ -129,6 +138,10 @@ class EvolutionEngine:
             context=config.evolution.context,
             direction=config.evolution.direction,
             random_seed=config.run.random_seed,
+            lasso_min_pairs=config.evolution.lasso_min_pairs,
+            mutation_context_source=config.evolution.mutation_context_source,
+            use_cluster_summary=config.evolution.use_cluster_summary,
+            use_outlier_removal=config.evaluation.use_outlier_removal,
         )
 
         clusterer = AttributeClusterer(
@@ -145,21 +158,17 @@ class EvolutionEngine:
             random_seed=config.run.random_seed,
         )
 
-        selector = ParetoSelector(
-            direction=config.evolution.direction,
-        )
-
         return cls(
             config=config,
             topic_states=topic_states,
             reward_model=reward_model,
             judge_model=judge_model,
+            detector_model=detector_model,
             evaluator=evaluator,
             amp_scorer=amp_scorer,
             initial_planner=initial_planner,
             mutator=mutator,
             clusterer=clusterer,
-            selector=selector,
             tracker=tracker,
         )
 
@@ -173,7 +182,7 @@ class EvolutionEngine:
         # Load and score baselines
         logger.info("Loading and scoring baselines...")
         for ts in self.topic_states:
-            load_baselines_from_manifest(ts, cfg.data.baseline_manifest)
+            load_baselines_from_manifest(ts, cfg.data.baseline_manifest, cfg.data.baseline_root)
         await asyncio.gather(*(score_baselines(ts, self.reward_model) for ts in self.topic_states))
 
         # Step 0: initial planning
@@ -186,6 +195,7 @@ class EvolutionEngine:
                 await self._cluster_step(ts, step_idx=0, n_pop=cfg.evolution.initial_pop_size * 2)
 
         await self._evaluate_and_select(step_idx=0)
+        n_steps_completed = 1
 
         # Steps 1..N-1: mutate + evaluate
         for step_idx in range(1, cfg.evolution.n_steps):
@@ -199,16 +209,27 @@ class EvolutionEngine:
                     await self._cluster_step(ts, step_idx=step_idx, n_pop=n_pop)
 
             await self._evaluate_and_select(step_idx=step_idx)
+            n_steps_completed += 1
+
+        from search.utils.cost import estimate_cost
+        estimated_cost = estimate_cost(cfg)["total"]
 
         results = SearchResults(
             run_id=cfg.run.name,
             config_snapshot=cfg.to_dict(),
-            pareto_front=self._all_pareto_points,
-            n_steps_completed=cfg.evolution.n_steps,
-            cost_usd=self._total_cost_usd,
+            top_attributes=list(self._all_found.values()),
+            n_steps_completed=n_steps_completed,
+            cost_usd=estimated_cost,
             wall_time_seconds=time.time() - t_start,
         )
         return results
+
+    async def shutdown(self) -> None:
+        """Close all caller cache connections before the event loop exits."""
+        for caller_owner in (self.initial_planner, self.mutator, self.clusterer,
+                             self.judge_model, self.detector_model):
+            if hasattr(caller_owner, "caller"):
+                await caller_owner.caller.shutdown()
 
     # ─── Clustering helper ────────────────────────────────────────────────────
 
@@ -264,28 +285,29 @@ class EvolutionEngine:
                 rng=rng,
             )
 
-            # B — judge scoring (ΔJ) on a subset of prompts
+            # B — judge scoring (ΔJ) on all batch prompts
             judge_prompts = batch_prompts
             await self._score_judge(ts, step, judge_prompts, eval_cfg.judge_first_n_rollouts)
 
             # C — filter to undesirable candidates before expensive A(g) computation
+            ror = eval_cfg.use_outlier_removal
             scored_attrs = [
                 (attr, s) for attr, s in step.attributes.items()
-                if s.delta_rm() is not None and s.delta_j() is not None
+                if s.delta_rm(ror) is not None and s.delta_j() is not None
             ]
-            undesirable = [(attr, s) for attr, s in scored_attrs if s.delta_rm() > 0 and s.delta_j() < 0]
-            if len(undesirable) >= pop_size:
+            undesirable = [(attr, s) for attr, s in scored_attrs if s.delta_rm(ror) > 0 and s.delta_j() < 0]
+            if len(undesirable) >= pop_size * 2:
                 amp_candidates = [attr for attr, _ in undesirable]
             else:
-                # Not enough undesirable ones — pad up to pop_size by |ΔRM| descending
+                # Pad to pop_size*2 buffer by ΔRM descending
                 undesirable_set = {attr for attr, _ in undesirable}
                 rest = sorted(
                     [(attr, s) for attr, s in scored_attrs if attr not in undesirable_set],
-                    key=lambda x: abs(x[1].delta_rm() or 0.0),
+                    key=lambda x: x[1].delta_rm(ror) or 0.0,
                     reverse=True,
                 )
                 amp_candidates = [attr for attr, _ in undesirable] + [
-                    attr for attr, _ in rest[: pop_size - len(undesirable)]
+                    attr for attr, _ in rest[: pop_size * 2 - len(undesirable)]
                 ]
 
             logger.info(
@@ -295,10 +317,11 @@ class EvolutionEngine:
 
             # D — amplification scores A(g) on filtered candidates only
             # Sample prompts + images from the manifest baseline pool
-            amp_prompts = rng.sample(
-                [p for p in train_prompts if p in ts.baselines],
-                min(eval_cfg.amp_n_prompts, sum(1 for p in train_prompts if p in ts.baselines)),
-            )
+            # amp_prompts = rng.sample(
+            #     [p for p in train_prompts if p in ts.baselines],
+            #     min(eval_cfg.amp_n_prompts, sum(1 for p in train_prompts if p in ts.baselines)),
+            # )
+            amp_prompts = batch_prompts
             amp_baselines: dict[str, list] = {
                 p: rng.sample(ts.baselines[p], min(eval_cfg.amp_n_images_per_prompt, len(ts.baselines[p])))
                 for p in amp_prompts
@@ -307,19 +330,38 @@ class EvolutionEngine:
                 attributes=amp_candidates,
                 baselines_by_prompt=amp_baselines,
                 reward_model_name=reward_name,
+                attrs_stats_map=step.attributes,
             )
             for attr, score in amp_scores.items():
                 if attr in step.attributes:
                     step.attributes[attr].meta.amplification_score = score
 
-            # E — Pareto selection
-            selector = ParetoSelector(
+            # E — TopK selection from amp-scored candidates
+            amp_stats = [step.attributes[a] for a in amp_candidates if a in step.attributes]
+            selector = TopKSelector(
                 direction=cfg.evolution.direction,
                 target_pop_size=pop_size,
+                use_outlier_removal=eval_cfg.use_outlier_removal,
             )
-            result = selector.select(ts, step_idx)
+            result = selector.select(amp_stats, ts.surviving, step_idx, ts.topic_id)
             ts.surviving = result.surviving
-            self._all_pareto_points.extend(result.pareto_points)
+            for fa in result.selected:
+                key = (fa.attribute, fa.topic_id)
+                if key not in self._all_found:
+                    self._all_found[key] = fa
+                else:
+                    # Re-selected carry-over: update scores with latest evaluation, preserve step_found
+                    prev = self._all_found[key]
+                    self._all_found[key] = FoundAttribute(
+                        attribute=fa.attribute,
+                        delta_rm=fa.delta_rm,
+                        delta_j=fa.delta_j,
+                        amplification_score=fa.amplification_score,
+                        step_found=prev.step_found,
+                        step_last_survived=fa.step_last_survived,
+                        topic_id=fa.topic_id,
+                        is_undesirable=fa.is_undesirable or prev.is_undesirable,
+                    )
 
             # Log
             should_log_images = (step_idx % cfg.logging.log_images_every_n_steps == 0)
@@ -327,8 +369,9 @@ class EvolutionEngine:
                 step_idx=step_idx,
                 topic_id=ts.topic_id,
                 stats_map=step.attributes,
-                selected=result.pareto_points,
+                selected=result.selected,
                 cost_usd=0.0,
+                use_outlier_removal=eval_cfg.use_outlier_removal,
             )
             if should_log_images:
                 self.tracker.log_image_pairs(

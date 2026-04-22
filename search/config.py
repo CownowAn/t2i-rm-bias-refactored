@@ -23,6 +23,7 @@ class RunConfig:
 @dataclass
 class DataConfig:
     baseline_manifest: str = ""
+    baseline_root: str = ""  # prefix for relative image_path entries in manifest; empty = CWD
     prompts_dir: str = ""
     topic_ids: list[int] = field(default_factory=lambda: [0])
     val_split_size: int = 40
@@ -51,6 +52,13 @@ class JudgeConfig:
 
 
 @dataclass
+class DetectorConfig:
+    model: str = "openai/gpt-4o-mini"
+    max_tokens: int = 50000
+    max_parallel: int = 32
+
+
+@dataclass
 class PlannerConfig:
     model: str = "openai/gpt-5"
     reasoning: str | None = "high"
@@ -71,6 +79,7 @@ class ModelsConfig:
     reward_model: RewardModelConfig = field(default_factory=RewardModelConfig)
     editor: EditorConfig = field(default_factory=EditorConfig)
     judge: JudgeConfig = field(default_factory=JudgeConfig)
+    detector: DetectorConfig = field(default_factory=DetectorConfig)
     planner: PlannerConfig = field(default_factory=PlannerConfig)
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
 
@@ -84,9 +93,14 @@ class EvolutionConfig:
     n_context_imgs: int = 16
     n_attrs_per_prompt: int = 4
     n_per_user_prompt: int = 1
+    n_initial_plan_prompts: int | None = None  # None = use all train prompts
+    initial_context_sampling: str = "random"  # "random" | "stratified" (top-half + bottom-half by reward)
+    use_cluster_summary: bool = True
     direction: str = "plus"
-    image_order: str = "ascending"   # order images are shown to the planner LLM
+    image_order: str = "descending"   # order images are shown to the planner LLM
     context: str = "ancestry"
+    mutation_context_source: str = "origin"  # "origin" | "accumulated" | "latest"
+    lasso_min_pairs: int = 5
     cosine_sim_threshold_initial: float = 0.9
     cosine_sim_threshold_evolution: float = 0.9
 
@@ -99,6 +113,7 @@ class EvaluationConfig:
     judge_first_n_rollouts: int = 1
     amp_n_prompts: int = 32          # prompts to use for A(g) computation
     amp_n_images_per_prompt: int = 64  # baseline images per prompt for A(g)
+    use_outlier_removal: bool = False
 
 
 @dataclass
@@ -139,7 +154,7 @@ class SearchConfig:
 
         config = _from_dict(cls, raw)
         if config.run.name is None:
-            config.run.name = f"t2i-{timestamp()}"
+            config.run.name = f"{timestamp()}"
         return config
 
     # ── Validation ────────────────────────────────────────────────────────────
@@ -157,8 +172,12 @@ class SearchConfig:
         assert self.evolution.direction in ("plus", "minus"), (
             f"direction must be 'plus' or 'minus', got {self.evolution.direction!r}"
         )
-        assert self.evolution.context in ("all", "ancestry", "vanilla"), (
-            f"context must be 'all', 'ancestry', or 'vanilla'"
+        assert self.evolution.context in ("all", "ancestry", "vanilla", "residual"), (
+            f"context must be 'all', 'ancestry', 'vanilla', or 'residual'"
+        )
+        assert self.evolution.initial_context_sampling in ("random", "stratified"), (
+            f"initial_context_sampling must be 'random' or 'stratified', "
+            f"got {self.evolution.initial_context_sampling!r}"
         )
 
     # ── Serialization ─────────────────────────────────────────────────────────
@@ -212,7 +231,7 @@ def _cast_value(s: str) -> Any:
 
 _LEAF_TYPES = {
     RunConfig, DataConfig, RewardModelConfig, EditorConfig, JudgeConfig,
-    PlannerConfig, ClusterConfig, ModelsConfig, EvolutionConfig,
+    DetectorConfig, PlannerConfig, ClusterConfig, ModelsConfig, EvolutionConfig,
     EvaluationConfig, WandbConfig, LoggingConfig, SearchConfig,
 }
 

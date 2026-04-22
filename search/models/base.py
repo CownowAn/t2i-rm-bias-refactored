@@ -46,6 +46,15 @@ class JudgeModel(ABC):
     ) -> list[ComparisonResult]: ...
 
     @abstractmethod
+    def to_dict(self) -> dict[str, Any]: ...
+
+
+class DetectorModel(ABC):
+    @property
+    @abstractmethod
+    def model_name(self) -> str: ...
+
+    @abstractmethod
     async def detect(
         self,
         image_paths: list[str],

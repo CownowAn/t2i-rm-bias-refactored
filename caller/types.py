@@ -13,6 +13,15 @@ import base64
 from pathlib import Path
 from loguru import logger
 from typing import Sequence, Any, Literal, Optional, Union
+
+# OpenAI models that support the `reasoning` parameter (effort/summary).
+# Models not in this set will have the reasoning param silently dropped.
+_OPENAI_REASONING_MODELS: frozenset[str] = frozenset({
+    "o1", "o1-mini", "o1-preview", "o1-pro",
+    "o3", "o3-mini", "o3-pro",
+    "o4-mini",
+    "gpt-5", "gpt-5.2", "gpt-5-mini", "gpt-5-nano",
+})
 from pydantic import BaseModel
 
 
@@ -282,8 +291,13 @@ class Request(BaseModel):
         config_dict = self.config.model_dump()
         config_dict["max_output_tokens"] = config_dict.pop("max_tokens")
 
-        if config_dict["reasoning"] is None:
-            pass
+        model_slug = self.model.removeprefix("openai/")
+        supports_reasoning = model_slug in _OPENAI_REASONING_MODELS
+
+        if config_dict["reasoning"] is None or not supports_reasoning:
+            if config_dict["reasoning"] is not None and not supports_reasoning:
+                logger.debug(f"Model '{model_slug}' does not support reasoning; ignoring reasoning param.")
+            config_dict.pop("reasoning")
         elif isinstance(config_dict["reasoning"], int):
             logger.warning("Reasoning should be a string, not an integer, for OpenAICaller. Using 'medium' instead.")
             config_dict["reasoning"] = {"effort": "medium", "summary": "auto"}

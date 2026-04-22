@@ -38,17 +38,24 @@ async def main() -> None:
     logger.info(f"Output dir: {config.run_output_dir()}")
     logger.info(f"n_steps={config.evolution.n_steps}, direction={config.evolution.direction}")
 
+    from search.utils.cost import log_cost_estimate
+    log_cost_estimate(config)
+
     from search.logging.tracker import ExperimentTracker
     tracker = ExperimentTracker(
         config=config.logging,
         run_name=config.run.name,
         config_snapshot=config.to_dict(),
+        output_dir=Path(config.run_output_dir()),
     )
 
     from search.pipeline.evolution import EvolutionEngine
     engine = EvolutionEngine.from_config(config, tracker=tracker)
 
-    results = await engine.run()
+    try:
+        results = await engine.run()
+    finally:
+        await engine.shutdown()
 
     # Save results JSON
     output_path = config.run_output_dir() / "results.json"
@@ -57,8 +64,10 @@ async def main() -> None:
 
     tracker.log_final(results)
 
+    n_true_undesirable = sum(1 for fa in results.top_attributes if fa.is_undesirable)
     logger.info(
-        f"Done. {len(results.pareto_front)} undesirable attributes found "
+        f"Done. {n_true_undesirable} truly undesirable attributes found "
+        f"({len(results.top_attributes)} total including padding) "
         f"in {results.wall_time_seconds:.0f}s, cost=${results.cost_usd:.2f}"
     )
 

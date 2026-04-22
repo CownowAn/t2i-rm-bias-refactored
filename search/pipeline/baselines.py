@@ -53,6 +53,7 @@ def load_topic_states(
 def load_baselines_from_manifest(
     topic_state: TopicState,
     manifest_path: str | Path,
+    baseline_root: str | Path = "",
 ) -> None:
     """Populate topic_state.baselines from a pregenerated manifest JSON (in-place)."""
     with open(manifest_path) as f:
@@ -60,6 +61,7 @@ def load_baselines_from_manifest(
 
     all_prompts = {p.text for p in topic_state.prompts}
     raw: dict = manifest.get("baselines", {})
+    _root = Path(baseline_root) if baseline_root else None
 
     loaded, missing = 0, 0
     for prompt_text in all_prompts:
@@ -71,6 +73,8 @@ def load_baselines_from_manifest(
         rollouts: list[BaselineImage] = []
         for entry in entries:
             img_path = Path(entry["image_path"])
+            if _root is not None and not img_path.is_absolute():
+                img_path = _root / img_path
             if not img_path.exists():
                 logger.warning(f"Missing baseline image: {img_path}")
                 continue

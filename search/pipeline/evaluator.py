@@ -124,6 +124,7 @@ class CounterfactualEvaluator:
                 edited_image_path=Path(edited_path),
                 edit_instruction=instruction,
                 delta_rm=delta_rm,
+                step_idx=step.step_idx,
             )
             step.attributes[attr].pairs.setdefault(prompt_text, []).append(pair)
 

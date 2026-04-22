@@ -133,14 +133,14 @@ class AttributeClusterer:
             return attributes
 
         prompt = _CLUSTER_PROMPT.format(
-            cluster_summary=cluster_summary,
+            # cluster_summary=cluster_summary,
             attributes=json.dumps([{"index": i, "attribute": a} for i, a in enumerate(attributes)]),
         )
 
         responses = await self.caller.call(
             messages=[prompt],
             model=self.model_name,
-            max_parallel=1,
+            max_parallel=self.max_parallel,
             max_tokens=self.max_tokens,
             reasoning=self.reasoning,
             enable_cache=False,
@@ -158,15 +158,24 @@ class AttributeClusterer:
             logger.warning("Cluster result not a list; returning first n_pop")
             return attributes[:n_pop]
 
+        # Unwrap extra nesting: [[{...}]] → [{...}]
+        if cluster_results and isinstance(cluster_results[0], list):
+            cluster_results = cluster_results[0]
+
+        # Filter to dict entries only
+        cluster_results = [c for c in cluster_results if isinstance(c, dict)]
+        if not cluster_results:
+            logger.warning("Cluster result contained no dict entries; returning first n_pop")
+            return attributes[:n_pop]
+
         # Sort by cluster size, take top n_pop
-        try:
-            cluster_results.sort(key=lambda x: len(x.get("members", [])), reverse=True)
-        except Exception as e:
-            logger.warning(f"Sorting cluster results failed: {e}")
+        cluster_results.sort(key=lambda x: len(x.get("members", [])), reverse=True)
 
         reps: list[str] = []
         for cluster in cluster_results[:n_pop]:
             rep = cluster.get("representative", {})
+            if not isinstance(rep, dict):
+                continue
             idx = rep.get("index")
             if idx is not None and 0 <= idx < len(attributes):
                 reps.append(attributes[idx])

@@ -60,15 +60,19 @@ class FluxKontextApplier:
             return output_path
 
         from diffusers.utils import load_image
+        from PIL import Image
 
         with self._lock:
             self._load_pipeline()
             image = load_image(image_path)
+            original_size = image.size  # (w, h)
             result = self._pipeline(
                 prompt=instruction,
                 image=image,
                 guidance_scale=self.guidance_scale,
             ).images[0]
+            if result.size != original_size:
+                result = result.resize(original_size, resample=Image.LANCZOS)
 
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         result.save(output_path)

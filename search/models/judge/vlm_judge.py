@@ -8,13 +8,13 @@ from typing import Any
 from loguru import logger
 
 from caller import AutoCaller, ChatHistory, ChatMessage
-from search.models.base import JudgeModel, ComparisonResult
+from search.models.base import JudgeModel, DetectorModel, ComparisonResult
 from search.prompts.judging import IMAGE_JUDGE_SYSTEM, IMAGE_JUDGE_PROMPT
 from search.prompts.detection import ATTRIBUTE_DETECTION_SYSTEM, ATTRIBUTE_DETECTION_PROMPT
 
 
 class VisionLLMJudge(JudgeModel):
-    """Teacher judge: compares images + detects attributes via Vision LLM."""
+    """Pairwise image quality judge via Vision LLM."""
 
     def __init__(
         self,
@@ -103,6 +103,28 @@ class VisionLLMJudge(JudgeModel):
 
         return results
 
+    def to_dict(self) -> dict[str, Any]:
+        return {"model_name": self._model_name, "type": "vision_llm_judge"}
+
+
+class VisionLLMDetector(DetectorModel):
+    """Attribute presence detector via Vision LLM."""
+
+    def __init__(
+        self,
+        model_name: str = "openai/gpt-4o-mini",
+        max_tokens: int = 50000,
+        max_parallel: int = 32,
+    ):
+        self._model_name = model_name
+        self.max_tokens = max_tokens
+        self.max_parallel = max_parallel
+        self.caller = AutoCaller(dotenv_path=".env")
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
     async def detect(
         self,
         image_paths: list[str],
@@ -162,4 +184,4 @@ class VisionLLMJudge(JudgeModel):
         return results
 
     def to_dict(self) -> dict[str, Any]:
-        return {"model_name": self._model_name, "type": "vision_llm_judge"}
+        return {"model_name": self._model_name, "type": "vision_llm_detector"}

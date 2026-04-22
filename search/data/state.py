@@ -1,11 +1,10 @@
 from __future__ import annotations
-import math
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Any
 
 from search.data.types import Prompt, BaselineImage, CounterfactualPair
-from search.utils.stats import remove_outliers
+from search.utils.stats import remove_outliers as remove_outliers_fn
 
 
 @dataclass
@@ -19,6 +18,10 @@ class AttributeMeta:
     planner_prompt: str | None = None
     planner_reasoning: str | None = None
     amplification_score: float = 0.0
+    amp_mean_p1: float = 0.0   # mean P(g=1) across prompts
+    amp_mean_p0: float = 0.0   # mean P(g=0) across prompts
+    amp_mean_mu1: float = 0.0  # mean E[reward | g=1] across prompts
+    amp_mean_mu0: float = 0.0  # mean E[reward | g=0] across prompts
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in self.__dict__.items() if v is not None}
@@ -30,6 +33,8 @@ class AttributeStats:
     meta: AttributeMeta
     pairs: dict[str, list[CounterfactualPair]] = field(default_factory=dict)
     # prompt_text -> list of CounterfactualPairs (one per rollout)
+    baseline_detected: dict[str, int] = field(default_factory=dict)
+    # image_id -> 0/1 VLM detection result, populated by AmplificationScorer
 
     def _all_delta_rm(self) -> list[float]:
         scores = []
@@ -47,14 +52,12 @@ class AttributeStats:
                     scores.append(p.delta_j)
         return scores
 
-    def delta_rm(self) -> float | None:
+    def delta_rm(self, remove_outliers: bool = False) -> float | None:
         scores = self._all_delta_rm()
         if not scores:
             return None
-        # Only apply IQR outlier removal for continuous RM scores, not for {-1,0,1} judge scores
-        all_discrete = all(math.isclose(s, 1, abs_tol=1e-6) or math.isclose(s, 0, abs_tol=1e-6) or math.isclose(s, -1, abs_tol=1e-6) for s in scores)
-        if not all_discrete:
-            scores = remove_outliers(scores)
+        if remove_outliers:
+            scores = remove_outliers_fn(scores)
         return float(np.mean(scores)) if scores else None
 
     def delta_j(self) -> float | None:
@@ -63,8 +66,9 @@ class AttributeStats:
             return None
         return float(np.mean(scores))
 
-    def is_undesirable(self) -> bool:
-        rm, j = self.delta_rm(), self.delta_j()
+    def is_undesirable(self, use_outlier_removal: bool = False) -> bool:
+        rm = self.delta_rm(use_outlier_removal)
+        j = self.delta_j()
         return rm is not None and j is not None and rm > 0 and j < 0
 
     @property
@@ -74,7 +78,7 @@ class AttributeStats:
     def __repr__(self) -> str:
         return (
             f"AttributeStats(\n"
-            f"  attribute={self.attribute[:50]!r},\n"
+            f"  attribute={self.attribute!r},\n"
             f"  n_prompts={len(self.pairs)},\n"
             f"  delta_rm={self.delta_rm()},\n"
             f"  delta_j={self.delta_j()},\n"
@@ -107,3 +111,32 @@ class TopicState:
 
     def train_prompts(self) -> list[str]:
         return [p.text for p in self.prompts]
+
+    def get_accumulated_stats(self, attribute: str) -> "AttributeStats | None":
+        """Merge pairs from all steps where this attribute was evaluated."""
+        merged_pairs: dict[str, list[CounterfactualPair]] = {}
+        base_stats: AttributeStats | None = None
+        for step in self.history:
+            stats = step.attributes.get(attribute)
+            if stats is None:
+                continue
+            if base_stats is None:
+                base_stats = stats
+            for prompt, pairs in stats.pairs.items():
+                merged_pairs.setdefault(prompt, []).extend(pairs)
+        if base_stats is None:
+            return None
+        return AttributeStats(
+            attribute=attribute,
+            meta=base_stats.meta,
+            pairs=merged_pairs,
+            baseline_detected=base_stats.baseline_detected,
+        )
+
+    def get_latest_stats(self, attribute: str) -> "AttributeStats | None":
+        """Return the most recent completed step's AttributeStats for this attribute."""
+        for step in reversed(self.history[:-1]):  # exclude the new (current) step
+            stats = step.attributes.get(attribute)
+            if stats is not None:
+                return stats
+        return None

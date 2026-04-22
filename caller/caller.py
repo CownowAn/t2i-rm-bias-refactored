@@ -451,8 +451,7 @@ class OpenAICaller(CallerBaseClass):
             # logger.info(f"Sent an API call to model: {request.model}")
             response = await self.client.responses.create(**request_body_to_pass)
         except Exception as e:
-            note = f"Model: {request.model}. OpenAI API error."
-            e.add_note(note)
+            logger.debug(f"Model: {request.model}. OpenAI API error: {e}")
             raise
         
         return self.openai_response_to_unified(response.model_dump())
@@ -537,8 +536,7 @@ class AnthropicCaller(CallerBaseClass):
             # logger.info(f"Sent an API call to model: {request.model}")
             response = await self.client.messages.create(**request_body_to_pass)
         except Exception as e:
-            note = f"Model: {request.model}. Anthropic API error."
-            e.add_note(note)
+            logger.debug(f"Model: {request.model}. Anthropic API error: {e}")
             raise
         
         return self.anthropic_response_to_unified(response.model_dump())
@@ -675,6 +673,13 @@ class AutoCaller:
             else:
                 raise ValueError(f"No caller was found that supports the given model {model}")
 
+    async def shutdown(self) -> None:
+        """Flush cache and close connections for all initialized sub-callers."""
+        for name in ("openai", "anthropic", "openrouter"):
+            caller = getattr(self, f"_{name}_caller")
+            if caller is not None:
+                await caller.shutdown()
+
 
 class LocalCaller(CallerBaseClass):
     def __init__(
@@ -693,8 +698,7 @@ class LocalCaller(CallerBaseClass):
         try:
             chat_completion = await self.client.chat.completions.create(**request_body_to_pass)
         except Exception as e:
-            note = f"Model: {request.model}. Local API error."
-            e.add_note(note)
+            logger.debug(f"Model: {request.model}. OpenRouter API error: {e}")
             raise
 
         # print(chat_completion.model_dump_json())

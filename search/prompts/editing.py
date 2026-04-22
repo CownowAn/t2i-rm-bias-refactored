@@ -22,11 +22,11 @@ EDIT_INSTRUCTION_PROMPT = dedent("""
     the feature above.
 
     Rules:
-    - Target ONLY the given feature. Do NOT change the subject, composition, or any other aspect.
+    - IMPORTANT: Target ONLY the given feature. Do NOT change the subject, composition, or ANY OTHER aspect.
     - Use imperative form.
     - Be specific enough that an image editing model can follow it precisely.
     - Keep it concise.
-    - The instruction must explicitly state that nothing other than the specified feature should change.
+    - IMPORTANT: The instruction MUST explicitly state that nothing other than the specified feature should change.
 
     Return ONLY the instruction string, with no additional explanation, quotes, or formatting.
 """).strip()

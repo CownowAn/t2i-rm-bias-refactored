@@ -1,11 +1,12 @@
 run:
-  name: null           # auto-generated as "t2i-{timestamp}" if null
+  name: null           # auto-generated as "{timestamp}" if null
   output_dir: "outputs/"
   random_seed: 42
 
 data:
-  baseline_manifest: "data/baselines/topic_0/black-forest-labs/FLUX.1-dev/manifest.json"
-  prompts_dir: "data/user_prompts/diffusiondb/2m_random_1k/train"
+  baseline_manifest: "/home/sohyun0423/project/reward-model-bias/data/baselines/diffusiondb/2m_random_1k/train/topic_0/black-forest-labs/FLUX.1-dev/manifest.json"
+  baseline_root: "/home/sohyun0423/project/reward-model-bias"  # prefix for relative image paths in manifest
+  prompts_dir: "/home/sohyun0423/project/reward-model-bias/user_prompts/diffusiondb/2m_random_1k/train"
   topic_ids: [0]
   val_split_size: 40
 
@@ -26,17 +27,22 @@ models:
     max_tokens: 50000
     max_parallel: 32
 
+  detector:
+    model: "openai/gpt-4o-mini"
+    max_tokens: 50000
+    max_parallel: 32
+
   planner:
-    model: "openai/gpt-5"
+    model: "openai/gpt-5.2"
     reasoning: "high"
     max_tokens: 50000
     max_parallel: 64
 
   cluster:
     model: "openai/gpt-5.2"
-    max_tokens: 50000
+    max_tokens: 10000
     reasoning: "high"
-    max_parallel: 64
+    max_parallel: 1
 
 evolution:
   n_steps: 5
@@ -46,8 +52,13 @@ evolution:
   n_context_imgs: 16
   n_attrs_per_prompt: 4
   n_per_user_prompt: 1
+  n_initial_plan_prompts: 32          # null = use all train prompts
+  initial_context_sampling: "stratified"   # "random" | "stratified" (top-half + bottom-half by reward)
+  use_cluster_summary: false
   direction: "plus"            # "plus" = find attrs that raise RM score
-  context: "ancestry"          # "all" | "ancestry" | "vanilla"
+  image_order: "descending"
+  context: "vanilla"          # "all" | "ancestry" | "vanilla"
+  mutation_context_source: "accumulated"  # "origin" | "accumulated" | "latest"
   cosine_sim_threshold_initial: 0.9
   cosine_sim_threshold_evolution: 0.9
 
@@ -56,6 +67,9 @@ evaluation:
   n_rollouts_per_prompt: 1
   # judge_first_n_prompts: 32
   judge_first_n_rollouts: 1
+  amp_n_prompts: 32          
+  amp_n_images_per_prompt: 128
+  use_outlier_removal: false
 
 logging:
   wandb:

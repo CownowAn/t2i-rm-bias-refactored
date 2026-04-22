@@ -1,99 +1,103 @@
-"""Pareto-based attribute selection: pick surviving attributes after each evo step."""
+"""Top-K attribute selection by A(g): pick surviving attributes after each evo step."""
 from __future__ import annotations
 from dataclasses import dataclass
 
-import numpy as np
 from loguru import logger
 
-from search.data.state import TopicState, AttributeStats
-from search.data.results import ParetoPoint
+from search.data.state import AttributeStats
+from search.data.results import FoundAttribute
 
 
 @dataclass
 class SelectionResult:
     surviving: dict[str, int]   # attr -> step_idx where it was found
-    pareto_points: list[ParetoPoint]
+    selected: list[FoundAttribute]
 
 
-class ParetoSelector:
-    """Select top attributes based on ΔRM (high) and ΔJ (low) — the "undesirable" criterion."""
+class TopKSelector:
+    """Select top-K attributes by A(g).
+
+    Undesirable (ΔRM>0 & ΔJ<0) are prioritized; remaining slots filled by A(g) descending.
+    Expects pre-filtered candidates with A(g) already computed.
+    """
 
     def __init__(
         self,
         direction: str = "plus",
         target_pop_size: int = 4,
+        use_outlier_removal: bool = False,
     ):
         self.direction = direction
         self.target_pop_size = target_pop_size
-
-    def _teacher_threshold(
-        self, teacher_scores: list[float], strict: bool = False
-    ) -> float:
-        if not teacher_scores:
-            return 0.0
-        if self.direction == "plus":
-            return 0.0 if strict else float(np.percentile(teacher_scores, 50))
-        else:
-            return 0.0 if strict else float(np.percentile(teacher_scores, 50))
+        self.use_outlier_removal = use_outlier_removal
 
     def select(
         self,
-        topic_state: TopicState,
+        candidates: list[AttributeStats],
+        surviving: dict[str, int],
         step_idx: int,
-        strict: bool = False,
+        topic_id: int,
     ) -> SelectionResult:
-        """Choose surviving attributes from the current evo step."""
-        step = topic_state.history[step_idx]
-        candidates: list[AttributeStats] = [
-            s for s in step.attributes.values()
-            if s.delta_rm() is not None
-        ]
+        """Choose top-K from amp-scored candidates."""
+        scoreable = [s for s in candidates if s.delta_rm(self.use_outlier_removal) is not None]
 
-        if not candidates:
-            logger.warning(f"Topic {topic_state.topic_id}: no scoreable candidates at step {step_idx}")
-            return SelectionResult(surviving={}, pareto_points=[])
-
-        # Filter by teacher score
-        teacher_scores = [s.delta_j() for s in candidates if s.delta_j() is not None]
-        threshold = self._teacher_threshold([t for t in teacher_scores if t is not None], strict)
+        if not scoreable:
+            logger.warning(f"Topic {topic_id}: no scoreable candidates at step {step_idx}")
+            return SelectionResult(surviving={}, selected=[])
 
         if self.direction == "plus":
-            # Want ΔRM > 0 (high reward) and ΔJ < 0 (bad human preference)
-            # Teacher threshold: keep those with ΔJ <= threshold (lower = worse judge)
-            passing = [s for s in candidates if s.delta_j() is None or s.delta_j() <= threshold]
+            undesirable = [
+                s for s in scoreable
+                if (s.delta_rm(self.use_outlier_removal) or 0.0) > 0
+                and s.delta_j() is not None and s.delta_j() < 0
+            ]
         else:
-            passing = [s for s in candidates if s.delta_j() is None or s.delta_j() >= threshold]
+            undesirable = [
+                s for s in scoreable
+                if (s.delta_rm(self.use_outlier_removal) or 0.0) < 0
+                and s.delta_j() is not None and s.delta_j() > 0
+            ]
 
-        # Fallback: if nothing passes, take all
-        if not passing:
-            passing = candidates
+        rest = [s for s in scoreable if s not in undesirable]
 
-        # Sort by |ΔRM| descending (find strongest undesirable biases)
-        passing.sort(key=lambda s: abs(s.delta_rm() or 0.0), reverse=True)
+        def sort_key(s: AttributeStats) -> tuple[float, float]:
+            return (s.amplification_score, abs(s.delta_rm(self.use_outlier_removal) or 0.0))
 
-        selected = passing[:self.target_pop_size]
+        undesirable.sort(key=sort_key, reverse=True)
+        rest.sort(key=sort_key, reverse=True)
 
-        # Build surviving dict and ParetoPoints
-        surviving: dict[str, int] = {s.attribute: step_idx for s in selected}
-        pareto_points: list[ParetoPoint] = []
-        for s in selected:
-            pareto_points.append(ParetoPoint(
+        selected = undesirable[: self.target_pop_size]
+        if len(selected) < self.target_pop_size:
+            selected += rest[: self.target_pop_size - len(selected)]
+
+        # Build surviving dict — preserve original step_idx for carry-over attributes
+        new_surviving: dict[str, int] = {
+            s.attribute: surviving.get(s.attribute, step_idx) for s in selected
+        }
+
+        undesirable_set = set(id(s) for s in undesirable)
+        result_points: list[FoundAttribute] = [
+            FoundAttribute(
                 attribute=s.attribute,
-                delta_rm=s.delta_rm() or 0.0,
+                delta_rm=s.delta_rm(self.use_outlier_removal) or 0.0,
                 delta_j=s.delta_j() or 0.0,
                 amplification_score=s.amplification_score,
                 step_found=step_idx,
-                topic_id=topic_state.topic_id,
-            ))
+                step_last_survived=step_idx,
+                topic_id=topic_id,
+                is_undesirable=id(s) in undesirable_set,
+            )
+            for s in selected
+        ]
 
         logger.info(
-            f"Topic {topic_state.topic_id} step {step_idx}: "
-            f"{len(candidates)} candidates → {len(selected)} survivors"
+            f"Topic {topic_id} step {step_idx}: "
+            f"{len(scoreable)} candidates → {len(result_points)} survivors"
         )
-        for pp in pareto_points:
+        for pp in result_points:
             logger.info(
                 f"  ΔRM={pp.delta_rm:+.3f}  ΔJ={pp.delta_j:+.3f}  "
                 f"A(g)={pp.amplification_score:.4f}  | {pp.attribute}"
             )
 
-        return SelectionResult(surviving=surviving, pareto_points=pareto_points)
+        return SelectionResult(surviving=new_surviving, selected=result_points)

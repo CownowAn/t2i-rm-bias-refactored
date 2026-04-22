@@ -25,8 +25,11 @@ class InitialPlanner:
         n_attrs_per_prompt: int = 4,
         n_per_user_prompt: int = 1,
         n_context_imgs: int = 16,
+        n_initial_plan_prompts: int | None = None,
+        initial_context_sampling: str = "random",
+        use_cluster_summary: bool = True,
         direction: str = "plus",
-        order: str = "ascending",
+        order: str = "descending",
         random_seed: int = 42,
     ):
         self.model_name = model_name
@@ -36,6 +39,9 @@ class InitialPlanner:
         self.n_attrs_per_prompt = n_attrs_per_prompt
         self.n_per_user_prompt = n_per_user_prompt
         self.n_context_imgs = n_context_imgs
+        self.n_initial_plan_prompts = n_initial_plan_prompts
+        self.initial_context_sampling = initial_context_sampling
+        self.use_cluster_summary = use_cluster_summary
         self.direction = direction
         self.order = order
         self.random_seed = random_seed
@@ -56,6 +62,8 @@ class InitialPlanner:
             topic_state.history.append(step)
 
             train_prompts = [p.text for p in topic_state.prompts]
+            if self.n_initial_plan_prompts is not None:
+                train_prompts = rng.sample(train_prompts, min(self.n_initial_plan_prompts, len(train_prompts)))
             for prompt_text in train_prompts:
                 baselines = topic_state.baselines.get(prompt_text, [])
                 scored = [b for b in baselines if reward_model_name in b.reward_scores]
@@ -63,18 +71,40 @@ class InitialPlanner:
                     continue
 
                 for _ in range(self.n_per_user_prompt):
-                    sampled = rng.sample(scored, min(self.n_context_imgs, len(scored)))
+                    n = min(self.n_context_imgs, len(scored))
+                    if self.initial_context_sampling == "stratified":
+                        sorted_scored = sorted(scored, key=lambda b: b.reward_scores[reward_model_name])
+                        n_bottom = n // 2
+                        n_top = n - n_bottom
+                        sampled = sorted_scored[:n_bottom] + sorted_scored[-n_top:]
+                    else:
+                        sampled = rng.sample(scored, n)
                     higher_lower = "higher-scoring" if self.direction == "plus" else "lower-scoring"
                     reverse = (self.order == "descending")
                     sampled.sort(key=lambda b: b.reward_scores[reward_model_name], reverse=reverse)
                     display_scores = [round(b.reward_scores[reward_model_name], 2) for b in sampled]
 
+                    if self.use_cluster_summary and topic_state.cluster_summary:
+                        general_constraint_block = (
+                            "the feature must apply to images from ANY sensible text prompt "
+                            "in this cluster:\n"
+                            "      <user_prompt_cluster_summary>\n"
+                            f"      {topic_state.cluster_summary}\n"
+                            "      </user_prompt_cluster_summary>"
+                        )
+                        general_check_block = "applies to ANY image in this cluster"
+                    else:
+                        general_constraint_block = (
+                            "the feature must be applicable to any image, "
+                            "regardless of its specific subject or scene."
+                        )
+                        general_check_block = "applies to any image regardless of subject or scene"
                     pre_text = (
                         PLANNER_SYSTEM + "\n\n"
                         + LIST_PROMPT_PRE.format(
                             n_attrs_per_prompt=self.n_attrs_per_prompt,
                             higher_lower=higher_lower,
-                            cluster_summary=topic_state.cluster_summary,
+                            general_constraint_block=general_constraint_block,
                             order=self.order,
                         )
                         + f"\n\nUser prompt: {prompt_text}\n"
@@ -93,6 +123,7 @@ class InitialPlanner:
                         n_attrs_per_prompt=self.n_attrs_per_prompt,
                         higher_lower=higher_lower,
                         bias_nudge=BIAS_NUDGE[self.direction],
+                        general_check_block=general_check_block,
                     )
                     content.append({"type": "input_text", "text": post_text})
 

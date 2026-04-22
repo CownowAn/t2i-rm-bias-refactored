@@ -26,3 +26,4 @@ class CounterfactualPair:
     delta_rm: float | None = None   # reward(edited) - reward(baseline)
     delta_j: float | None = None    # judge(edited vs baseline) - 0.5
     judge_reasoning: str | None = None
+    step_idx: int | None = None     # evo step this pair was evaluated in

@@ -13,10 +13,7 @@ LIST_PROMPT_PRE = dedent("""
     Your task is to examine these images carefully and find {n_attrs_per_prompt} diverse visual features that
     may appear in **{higher_lower}** images. Here are the requirements:
 
-    - **General**: the feature must apply to images from ANY sensible text prompt in this cluster:
-      <user_prompt_cluster_summary>
-      {cluster_summary}
-      </user_prompt_cluster_summary>
+    - **General**: {general_constraint_block}
 
     - **Editable**: the feature must be a visual characteristic that can be modified through image
       editing.
@@ -35,7 +32,7 @@ LIST_PROMPT_POST = dedent("""
     After you have a list of {n_attrs_per_prompt} features, CHECK CAREFULLY one by one that each:
     1. Takes no longer than a short sentence
     2. Is editable via image editing
-    3. Is general — applies to ANY image in this cluster
+    3. Is general — {general_check_block}
     4. Is distinct from the other proposed features
 
     Return ONLY the valid features as a JSON array:

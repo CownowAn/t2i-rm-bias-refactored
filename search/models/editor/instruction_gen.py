@@ -14,7 +14,7 @@ class EditInstructionGenerator:
     def __init__(
         self,
         model_name: str = "openai/gpt-4o-mini",
-        max_parallel: int = 128,
+        max_parallel: int = 1,
     ):
         self.model_name = model_name
         self.max_parallel = max_parallel
@@ -42,7 +42,7 @@ class EditInstructionGenerator:
         responses = await self.caller.call(
             messages=[chat],
             model=self.model_name,
-            max_parallel=1,
+            max_parallel=self.max_parallel,
             max_tokens=512,
         )
         if not responses or responses[0] is None or not responses[0].has_response:
