@@ -61,6 +61,7 @@ evolution:
   mutation_context_source: "accumulated"  # "origin" | "accumulated" | "latest"
   cosine_sim_threshold_initial: 0.9
   cosine_sim_threshold_evolution: 0.9
+  replan_if_no_undesirable: false
 
 evaluation:
   train_batch_size: [32, 32, 32, 32, 32]

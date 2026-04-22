@@ -53,13 +53,38 @@ class InitialPlanner:
         reward_model_name: str,
     ) -> None:
         """Populate history[0] on each TopicState with initial AttributeStats."""
+        await self._plan_impl(topic_states, reward_model_name, target_step_idx=None)
+
+    async def plan_into_step(
+        self,
+        topic_states: list[TopicState],
+        step_idx: int,
+        reward_model_name: str,
+    ) -> None:
+        """Add freshly planned attributes into an existing step (no new EvoStep created)."""
+        await self._plan_impl(topic_states, reward_model_name, target_step_idx=step_idx)
+
+    async def _plan_impl(
+        self,
+        topic_states: list[TopicState],
+        reward_model_name: str,
+        target_step_idx: int | None,
+    ) -> None:
+        """Shared implementation for plan() and plan_into_step().
+
+        target_step_idx=None: create a new EvoStep at index 0 (initial planning).
+        target_step_idx=N:    add candidates into ts.history[N] (replan fallback).
+        """
         to_send: list[ChatHistory] = []
         metas: list[dict[str, Any]] = []
 
         for topic_state in topic_states:
             rng = Random(self.random_seed + topic_state.topic_id)
-            step = EvoStep(step_idx=0)
-            topic_state.history.append(step)
+            if target_step_idx is None:
+                step = EvoStep(step_idx=0)
+                topic_state.history.append(step)
+            else:
+                step = topic_state.history[target_step_idx]
 
             train_prompts = [p.text for p in topic_state.prompts]
             if self.n_initial_plan_prompts is not None:
@@ -150,7 +175,9 @@ class InitialPlanner:
             desc="Initial planning",
         )
 
-        # Parse and store attributes into history[0]
+        # Parse and store attributes into the target step
+        operation = "initial" if target_step_idx is None else "replan"
+        desc = "initial attributes" if target_step_idx is None else "replan attributes"
         topic_state_by_id = {ts.topic_id: ts for ts in topic_states}
         for i, resp in enumerate(responses):
             if resp is None:
@@ -165,16 +192,17 @@ class InitialPlanner:
             attributes = [str(a).strip() for a in attributes if a]
 
             ts = topic_state_by_id[meta["topic_id"]]
-            step = ts.history[0]
+            sidx = 0 if target_step_idx is None else target_step_idx
+            step = ts.history[sidx]
             for attr in attributes:
                 if attr not in step.attributes:
                     step.attributes[attr] = AttributeStats(
                         attribute=attr,
                         meta=AttributeMeta(
-                            time_step=0,
+                            time_step=sidx,
                             parent=None,
                             parent_time_step=None,
-                            operation="initial",
+                            operation=operation,
                             planner_model=meta["planner_model"],
                             reasoning_effort=meta["reasoning_effort"],
                             planner_prompt=meta["planner_prompt"],
@@ -183,5 +211,6 @@ class InitialPlanner:
                     )
 
         for ts in topic_states:
-            n = len(ts.history[0].attributes) if ts.history else 0
-            logger.info(f"Topic {ts.topic_id}: {n} initial attributes generated")
+            sidx = 0 if target_step_idx is None else target_step_idx
+            n = len(ts.history[sidx].attributes) if ts.history else 0
+            logger.info(f"Topic {ts.topic_id}: {n} {desc} generated")

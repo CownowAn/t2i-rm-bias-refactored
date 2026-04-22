@@ -103,6 +103,7 @@ class EvolutionConfig:
     lasso_min_pairs: int = 5
     cosine_sim_threshold_initial: float = 0.9
     cosine_sim_threshold_evolution: float = 0.9
+    replan_if_no_undesirable: bool = False
 
 
 @dataclass

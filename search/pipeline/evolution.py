@@ -202,7 +202,29 @@ class EvolutionEngine:
             logger.info(f"=== Step {step_idx}: Mutation ===")
             await self.mutator.mutate(self.topic_states)
 
-            # Cluster after mutation
+            # Replan fallback: if no truly undesirable survivors, add fresh candidates
+            if cfg.evolution.replan_if_no_undesirable:
+                topics_to_replan = [
+                    ts for ts in self.topic_states
+                    if not any(
+                        self._all_found.get((attr, ts.topic_id),
+                                           FoundAttribute(attribute="", delta_rm=0.0, delta_j=0.0,
+                                                          amplification_score=0.0, step_found=0,
+                                                          step_last_survived=0, topic_id=0,
+                                                          is_undesirable=False)).is_undesirable
+                        for attr in ts.surviving
+                    )
+                ]
+                if topics_to_replan:
+                    logger.info(
+                        f"Step {step_idx}: no undesirable survivors in topic(s) "
+                        f"{[ts.topic_id for ts in topics_to_replan]} — re-planning fresh candidates"
+                    )
+                    await self.initial_planner.plan_into_step(
+                        topics_to_replan, step_idx, reward_name
+                    )
+
+            # Cluster after mutation (+ replan if triggered)
             for ts in self.topic_states:
                 if len(ts.history) > step_idx:
                     n_pop = cfg.evolution.target_pop_sizes[step_idx] * 2
