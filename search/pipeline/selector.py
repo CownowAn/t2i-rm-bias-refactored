@@ -17,8 +17,9 @@ class SelectionResult:
 class TopKSelector:
     """Select top-K attributes by A(g).
 
-    Undesirable (ΔRM>0 & ΔJ<0) are prioritized; remaining slots filled by A(g) descending.
-    Expects pre-filtered candidates with A(g) already computed.
+    Undesirable (ΔRM>0 & ΔJ<0) are prioritized; remaining slots filled by A(g) descending
+    unless strict_undesirable_selection=True, in which case only truly undesirable attributes
+    are selected (may return fewer than target_pop_size).
     """
 
     def __init__(
@@ -26,10 +27,12 @@ class TopKSelector:
         direction: str = "plus",
         target_pop_size: int = 4,
         use_outlier_removal: bool = False,
+        strict_undesirable_selection: bool = False,
     ):
         self.direction = direction
         self.target_pop_size = target_pop_size
         self.use_outlier_removal = use_outlier_removal
+        self.strict_undesirable_selection = strict_undesirable_selection
 
     def select(
         self,
@@ -48,26 +51,28 @@ class TopKSelector:
         if self.direction == "plus":
             undesirable = [
                 s for s in scoreable
-                if (s.delta_rm(self.use_outlier_removal) or 0.0) > 0
-                and s.delta_j() is not None and s.delta_j() < 0
+                if s.is_undesirable(self.use_outlier_removal)
             ]
         else:
             undesirable = [
                 s for s in scoreable
-                if (s.delta_rm(self.use_outlier_removal) or 0.0) < 0
-                and s.delta_j() is not None and s.delta_j() > 0
+                if not s.is_undesirable(self.use_outlier_removal)
             ]
 
         rest = [s for s in scoreable if s not in undesirable]
 
         def sort_key(s: AttributeStats) -> tuple[float, float]:
-            return (s.amplification_score, abs(s.delta_rm(self.use_outlier_removal) or 0.0))
+            drm = s.delta_rm(self.use_outlier_removal)
+            if drm is None:
+                drm = float("-inf") if self.direction == "plus" else float("inf")
+            secondary = drm if self.direction == "plus" else -drm
+            return (s.amplification_score, secondary)
 
         undesirable.sort(key=sort_key, reverse=True)
         rest.sort(key=sort_key, reverse=True)
 
         selected = undesirable[: self.target_pop_size]
-        if len(selected) < self.target_pop_size:
+        if not self.strict_undesirable_selection and len(selected) < self.target_pop_size:
             selected += rest[: self.target_pop_size - len(selected)]
 
         # Build surviving dict — preserve original step_idx for carry-over attributes
@@ -79,10 +84,10 @@ class TopKSelector:
         result_points: list[FoundAttribute] = [
             FoundAttribute(
                 attribute=s.attribute,
-                delta_rm=s.delta_rm(self.use_outlier_removal) or 0.0,
-                delta_j=s.delta_j() or 0.0,
+                delta_rm=s.delta_rm(self.use_outlier_removal),
+                delta_j=s.delta_j(),
                 amplification_score=s.amplification_score,
-                step_found=step_idx,
+                step_found=surviving.get(s.attribute, step_idx),
                 step_last_survived=step_idx,
                 topic_id=topic_id,
                 is_undesirable=id(s) in undesirable_set,
@@ -95,8 +100,10 @@ class TopKSelector:
             f"{len(scoreable)} candidates → {len(result_points)} survivors"
         )
         for pp in result_points:
+            drm_str = f"{pp.delta_rm:+.3f}" if pp.delta_rm is not None else "None"
+            dj_str  = f"{pp.delta_j:+.3f}"  if pp.delta_j  is not None else "None"
             logger.info(
-                f"  ΔRM={pp.delta_rm:+.3f}  ΔJ={pp.delta_j:+.3f}  "
+                f"  ΔRM={drm_str}  ΔJ={dj_str}  "
                 f"A(g)={pp.amplification_score:.4f}  | {pp.attribute}"
             )
 

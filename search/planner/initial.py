@@ -9,7 +9,7 @@ from loguru import logger
 from caller import AutoCaller, ChatHistory, ChatMessage
 from search.data.state import TopicState, AttributeStats, AttributeMeta, EvoStep
 from search.data.types import BaselineImage
-from search.prompts.planning import PLANNER_SYSTEM, LIST_PROMPT_PRE, LIST_PROMPT_POST, BIAS_NUDGE
+from search.prompts.planning import PLANNER_SYSTEM, LIST_PROMPT_PRE, LIST_PROMPT_POST, BIAS_NUDGE, BIAS_CHECK
 from search.utils.io import parse_json_response
 
 
@@ -131,6 +131,7 @@ class InitialPlanner:
                             higher_lower=higher_lower,
                             general_constraint_block=general_constraint_block,
                             order=self.order,
+                            bias_nudge=BIAS_NUDGE[self.direction],
                         )
                         + f"\n\nUser prompt: {prompt_text}\n"
                     )
@@ -148,6 +149,7 @@ class InitialPlanner:
                         n_attrs_per_prompt=self.n_attrs_per_prompt,
                         higher_lower=higher_lower,
                         bias_nudge=BIAS_NUDGE[self.direction],
+                        bias_check=BIAS_CHECK[self.direction],
                         general_check_block=general_check_block,
                     )
                     content.append({"type": "input_text", "text": post_text})

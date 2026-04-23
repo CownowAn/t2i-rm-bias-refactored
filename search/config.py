@@ -104,6 +104,7 @@ class EvolutionConfig:
     cosine_sim_threshold_initial: float = 0.9
     cosine_sim_threshold_evolution: float = 0.9
     replan_if_no_undesirable: bool = False
+    strict_undesirable_selection: bool = False
 
 
 @dataclass

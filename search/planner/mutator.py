@@ -12,7 +12,7 @@ from caller import AutoCaller, ChatHistory, ChatMessage
 from search.data.state import TopicState, AttributeStats, AttributeMeta, EvoStep
 from search.prompts.planning import PLANNER_SYSTEM
 from search.prompts.mutation import (
-    DIRECTION_GOAL, BIAS_NUDGE, MUTATE_PRE, MUTATE_POST_HEAD, get_post_tail,
+    DIRECTION_GOAL, BIAS_NUDGE, MUTATE_BIAS_CHECK, MUTATE_PRE, MUTATE_POST_HEAD, get_post_tail,
     MUTATE_POST_HEAD_RESIDUAL, MUTATE_POST_TAIL_RESIDUAL,
     MUTATE_PRE_GENERAL_WITH_CLUSTER, MUTATE_PRE_GENERAL_NO_CLUSTER,
     CLUSTER_SUMMARY_BLOCK_TEMPLATE,
@@ -105,12 +105,12 @@ class AttributeMutator:
             ancestor_attrs.append(parent)
 
             # Add text summary of the parent
-            sw = parent_stats.delta_rm()
+            sw = parent_stats.delta_rm(self.use_outlier_removal)
             tw = parent_stats.delta_j()
             summary = (
                 f"Ancestor: {parent}\n"
-                f"Metric A uplift: {sw:.3f if sw is not None else 'N/A'}\n"
-                f"Metric B uplift: {tw:.3f if tw is not None else 'N/A'}"
+                f"Metric A uplift: {f'{sw:.3f}' if sw is not None else 'N/A'}\n"
+                f"Metric B uplift: {f'{tw:.3f}' if tw is not None else 'N/A'}"
             )
             content_blocks.append({"type": "input_text", "text": summary})
 
@@ -217,9 +217,9 @@ class AttributeMutator:
             # All attributes evaluated in the last step (for neighbor data)
             last_step = topic_state.history[-1]
             last_step_attrs = [
-                {"attribute": a, "delta_rm": s.delta_rm(), "delta_j": s.delta_j()}
+                {"attribute": a, "delta_rm": s.delta_rm(self.use_outlier_removal), "delta_j": s.delta_j()}
                 for a, s in last_step.attributes.items()
-                if s.delta_rm() is not None and s.delta_j() is not None
+                if s.delta_rm(self.use_outlier_removal) is not None and s.delta_j() is not None
             ]
 
             new_step = EvoStep(step_idx=step_idx)
@@ -266,7 +266,7 @@ class AttributeMutator:
                 if ctx_stats is None:
                     continue
 
-                sw = ctx_stats.delta_rm()
+                sw = ctx_stats.delta_rm(self.use_outlier_removal)
                 tw = ctx_stats.delta_j()
                 current_summary = (
                     f"Attribute: {attribute}\n"
@@ -382,6 +382,7 @@ class AttributeMutator:
                             if self.use_cluster_summary
                             else MUTATE_POST_GENERAL_APPLIES_NO_CLUSTER
                         ),
+                        bias_check=MUTATE_BIAS_CHECK[self.direction],
                     )})
 
                     representative_prompt = (
@@ -442,7 +443,11 @@ class AttributeMutator:
                     valid_pairs.sort(key=lambda x: x[0].delta_rm)
                     n = len(valid_pairs)
                     half = self.n_rollouts_in_context // 2
-                    chosen = valid_pairs[:half] + valid_pairs[-half:] if n > self.n_rollouts_in_context else valid_pairs
+                    if n > self.n_rollouts_in_context:
+                        top = valid_pairs[-half:] if half > 0 else []
+                        chosen = valid_pairs[:half] + top
+                    else:
+                        chosen = valid_pairs
                     representative_prompt = chosen[0][1]
 
                     # Build multimodal content
@@ -478,6 +483,7 @@ class AttributeMutator:
                             if self.use_cluster_summary
                             else MUTATE_POST_GENERAL_APPLIES_NO_CLUSTER
                         ),
+                        "bias_check": MUTATE_BIAS_CHECK[self.direction],
                     }
                     if effective_context == "all" and neighbor_data:
                         fmt_kwargs["neighbor_data"] = neighbor_data

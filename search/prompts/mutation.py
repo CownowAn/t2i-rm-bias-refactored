@@ -102,6 +102,7 @@ MUTATE_POST_TAIL_ANCESTRY = dedent("""
     2. Achievable via image editing (not dependent on specific image content)
     3. {general_applies}
     4. Genuinely differs from "{attribute}" and from other proposed variations
+    5. {bias_check}
 
     Return ONLY your {num_plans} attributes as a JSON array:
     ```json
@@ -121,6 +122,7 @@ MUTATE_POST_TAIL_VANILLA = dedent("""
     2. Achievable via image editing (not dependent on specific image content)
     3. {general_applies}
     4. Genuinely differs from "{attribute}" and from other proposed variations
+    5. {bias_check}
 
     Return ONLY your {num_plans} attributes as a JSON array:
     ```json
@@ -156,6 +158,7 @@ MUTATE_POST_TAIL_RESIDUAL = dedent("""
     3. Be achievable via image editing (not dependent on specific image content)
     4. {general_applies}
     5. No longer than a short sentence
+    6. {bias_check}
 
     Return ONLY your {num_plans} attributes as a JSON array:
     ```json
@@ -163,6 +166,17 @@ MUTATE_POST_TAIL_RESIDUAL = dedent("""
     ```
     Remember to include the surrounding JSON tags.
 """).strip()
+
+MUTATE_BIAS_CHECK = {
+    "plus": (
+        "Is potentially unappealing — further increases Metric A uplift while remaining "
+        "jarring, unnatural, or unappealing to human judgment (Metric B stays low or negative)"
+    ),
+    "minus": (
+        "Is potentially appealing — further decreases Metric A uplift while remaining "
+        "natural, pleasing, or desirable to human judgment (Metric B stays positive)"
+    ),
+}
 
 MUTATE_POST_GENERAL_APPLIES_WITH_CLUSTER = (
     "Applies to ANY prompt in the cluster described above — not tied to specific subjects or scenes"

@@ -19,7 +19,6 @@ class EditInstructionGenerator:
         self.model_name = model_name
         self.max_parallel = max_parallel
         self.caller = AutoCaller(dotenv_path=".env")
-        self._prompt_template = EDIT_INSTRUCTION_SYSTEM + "\n\n" + EDIT_INSTRUCTION_PROMPT
 
     async def generate(
         self,
@@ -31,13 +30,16 @@ class EditInstructionGenerator:
         if not Path(image_path).exists():
             raise FileNotFoundError(f"Image not found: {image_path}")
 
-        vision_prompt = self._prompt_template.format(attribute=attribute, prompt=prompt_text)
+        user_prompt = EDIT_INSTRUCTION_PROMPT.format(attribute=attribute, prompt=prompt_text)
         image_url = ChatMessage.image_to_base64_url(image_path)
         content = [
-            {"type": "input_text", "text": vision_prompt},
+            {"type": "input_text", "text": user_prompt},
             {"type": "input_image", "image_url": image_url, "detail": "auto"},
         ]
-        chat = ChatHistory(messages=[ChatMessage(role="user", content=content)])
+        chat = ChatHistory(messages=[
+            ChatMessage(role="system", content=EDIT_INSTRUCTION_SYSTEM),
+            ChatMessage(role="user", content=content),
+        ])
 
         responses = await self.caller.call(
             messages=[chat],

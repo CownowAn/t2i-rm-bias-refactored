@@ -189,10 +189,18 @@ class EvolutionEngine:
         logger.info("=== Step 0: Initial Planning ===")
         await self.initial_planner.plan(self.topic_states, reward_model_name=reward_name)
 
+        # Log candidates from initial planning
+        for ts in self.topic_states:
+            if ts.history:
+                attrs = list(ts.history[0].attributes.keys())
+                logger.info(f"Topic {ts.topic_id} step 0: {len(attrs)} candidates after planning")
+                for a in attrs:
+                    logger.info(f"  {a}")
+
         # Cluster/deduplicate step 0
         for ts in self.topic_states:
             if ts.history:
-                await self._cluster_step(ts, step_idx=0, n_pop=cfg.evolution.initial_pop_size * 2)
+                await self._cluster_step(ts, step_idx=0, n_pop=cfg.evolution.initial_pop_size * 4)
 
         await self._evaluate_and_select(step_idx=0)
         n_steps_completed = 1
@@ -201,6 +209,23 @@ class EvolutionEngine:
         for step_idx in range(1, cfg.evolution.n_steps):
             logger.info(f"=== Step {step_idx}: Mutation ===")
             await self.mutator.mutate(self.topic_states)
+
+            # Log new mutations vs carry-overs
+            for ts in self.topic_states:
+                if len(ts.history) > step_idx:
+                    step = ts.history[step_idx]
+                    new_attrs = [(a, s) for a, s in step.attributes.items()
+                                 if s.meta.operation in ("mutate", "replan")]
+                    carry_attrs = [(a, s) for a, s in step.attributes.items()
+                                   if s.meta.operation == "carry_over"]
+                    logger.info(
+                        f"Topic {ts.topic_id} step {step_idx}: "
+                        f"{len(new_attrs)} new mutation(s), {len(carry_attrs)} carry-over(s)"
+                    )
+                    for a, _ in new_attrs:
+                        logger.info(f"  [new]   {a}")
+                    for a, _ in carry_attrs:
+                        logger.info(f"  [carry] {a}")
 
             # Replan fallback: if no truly undesirable survivors, add fresh candidates
             if cfg.evolution.replan_if_no_undesirable:
@@ -227,7 +252,7 @@ class EvolutionEngine:
             # Cluster after mutation (+ replan if triggered)
             for ts in self.topic_states:
                 if len(ts.history) > step_idx:
-                    n_pop = cfg.evolution.target_pop_sizes[step_idx] * 2
+                    n_pop = cfg.evolution.target_pop_sizes[step_idx] * 4
                     await self._cluster_step(ts, step_idx=step_idx, n_pop=n_pop)
 
             await self._evaluate_and_select(step_idx=step_idx)
@@ -317,7 +342,7 @@ class EvolutionEngine:
                 (attr, s) for attr, s in step.attributes.items()
                 if s.delta_rm(ror) is not None and s.delta_j() is not None
             ]
-            undesirable = [(attr, s) for attr, s in scored_attrs if s.delta_rm(ror) > 0 and s.delta_j() < 0]
+            undesirable = [(attr, s) for attr, s in scored_attrs if s.is_undesirable(ror)]
             if len(undesirable) >= pop_size * 2:
                 amp_candidates = [attr for attr, _ in undesirable]
             else:
@@ -325,7 +350,7 @@ class EvolutionEngine:
                 undesirable_set = {attr for attr, _ in undesirable}
                 rest = sorted(
                     [(attr, s) for attr, s in scored_attrs if attr not in undesirable_set],
-                    key=lambda x: x[1].delta_rm(ror) or 0.0,
+                    key=lambda x: x[1].delta_rm(ror) or float("-inf"),
                     reverse=True,
                 )
                 amp_candidates = [attr for attr, _ in undesirable] + [
@@ -364,6 +389,7 @@ class EvolutionEngine:
                 direction=cfg.evolution.direction,
                 target_pop_size=pop_size,
                 use_outlier_removal=eval_cfg.use_outlier_removal,
+                strict_undesirable_selection=cfg.evolution.strict_undesirable_selection,
             )
             result = selector.select(amp_stats, ts.surviving, step_idx, ts.topic_id)
             ts.surviving = result.surviving
@@ -372,14 +398,15 @@ class EvolutionEngine:
                 if key not in self._all_found:
                     self._all_found[key] = fa
                 else:
-                    # Re-selected carry-over: update scores with latest evaluation, preserve step_found
+                    # Re-selected carry-over: update scores with latest evaluation
+                    # step_found is already correct from selector (surviving.get(attr, step_idx))
                     prev = self._all_found[key]
                     self._all_found[key] = FoundAttribute(
                         attribute=fa.attribute,
                         delta_rm=fa.delta_rm,
                         delta_j=fa.delta_j,
                         amplification_score=fa.amplification_score,
-                        step_found=prev.step_found,
+                        step_found=fa.step_found,
                         step_last_survived=fa.step_last_survived,
                         topic_id=fa.topic_id,
                         is_undesirable=fa.is_undesirable or prev.is_undesirable,
@@ -448,3 +475,4 @@ class EvolutionEngine:
                 # score_diff: +1.0 = edited (A) wins, -1.0 = baseline (B) wins
                 # delta_j < 0 means judge prefers baseline (undesirable attribute criterion)
                 pairs[pidx].delta_j = result.score_diff
+        import pdb; pdb.set_trace()

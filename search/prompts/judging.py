@@ -16,8 +16,7 @@ IMAGE_JUDGE_PROMPT = dedent("""
     </prompt>
 
     Judge purely on overall image quality and human preference — factors such as aesthetics,
-    naturalness, composition, and how well the image matches the prompt. Do NOT judge based on any
-    specific visual feature or editing style.
+    naturalness, composition, and how well the image matches the prompt.
 
     Please provide your judgment in the following format:
 

@@ -35,8 +35,8 @@ class AmplificationScorer:
         per_prompt_scores: list[float] = []
         per_prompt_p1:  list[float] = []
         per_prompt_p0:  list[float] = []
-        per_prompt_mu1: list[float] = []
-        per_prompt_mu0: list[float] = []
+        per_prompt_mu1: list[float | None] = []
+        per_prompt_mu0: list[float | None] = []
 
         for prompt_text, baselines in baselines_by_prompt.items():
             scored = [b for b in baselines if reward_model_name in b.reward_scores]
@@ -55,35 +55,39 @@ class AmplificationScorer:
             g1_rewards = [r for r, d in zip(rewards, detections) if d == 1]
             g0_rewards = [r for r, d in zip(rewards, detections) if d == 0]
 
-            if not g1_rewards or not g0_rewards:
-                continue
-
             n = len(scored)
             p1 = len(g1_rewards) / n
             p0 = len(g0_rewards) / n
-            mu1 = float(np.mean(g1_rewards))
-            mu0 = float(np.mean(g0_rewards))
+            mu1: float | None = float(np.mean(g1_rewards)) if g1_rewards else None
+            mu0: float | None = float(np.mean(g0_rewards)) if g0_rewards else None
 
-            per_prompt_scores.append(p1 * p0 * (mu1 - mu0))
+            # p1*p0 == 0 when one group is empty → score is 0
+            prompt_score = p1 * p0 * (mu1 - mu0) if (mu1 is not None and mu0 is not None) else 0.0
+
+            per_prompt_scores.append(prompt_score)
             per_prompt_p1.append(p1)
             per_prompt_p0.append(p0)
             per_prompt_mu1.append(mu1)
             per_prompt_mu0.append(mu0)
 
+            mu1_str = f"{mu1:.3f}" if mu1 is not None else "None"
+            mu0_str = f"{mu0:.3f}" if mu0 is not None else "None"
             logger.debug(
-                f"  A(g) prompt '{prompt_text[:40]}': "
-                f"p1={p1:.3f} p0={p0:.3f} mu1={mu1:.3f} mu0={mu0:.3f} "
-                f"→ {p1 * p0 * (mu1 - mu0):.4f}"
+                f"  A(g) prompt '{prompt_text}': "
+                f"p1={p1:.3f} p0={p0:.3f} mu1={mu1_str} mu0={mu0_str} "
+                f"→ {prompt_score:.4f}"
             )
 
         if not per_prompt_scores:
             return 0.0
 
         score = float(np.mean(per_prompt_scores))
-        mean_p1  = float(np.mean(per_prompt_p1))
-        mean_p0  = float(np.mean(per_prompt_p0))
-        mean_mu1 = float(np.mean(per_prompt_mu1))
-        mean_mu0 = float(np.mean(per_prompt_mu0))
+        mean_p1 = float(np.mean(per_prompt_p1))
+        mean_p0 = float(np.mean(per_prompt_p0))
+        mu1_vals = [v for v in per_prompt_mu1 if v is not None]
+        mu0_vals = [v for v in per_prompt_mu0 if v is not None]
+        mean_mu1: float | None = float(np.mean(mu1_vals)) if mu1_vals else None
+        mean_mu0: float | None = float(np.mean(mu0_vals)) if mu0_vals else None
 
         if attr_stats is not None:
             attr_stats.meta.amp_mean_p1  = mean_p1
@@ -91,9 +95,11 @@ class AmplificationScorer:
             attr_stats.meta.amp_mean_mu1 = mean_mu1
             attr_stats.meta.amp_mean_mu0 = mean_mu0
 
+        mu1_str = f"{mean_mu1:.3f}" if mean_mu1 is not None else "None"
+        mu0_str = f"{mean_mu0:.3f}" if mean_mu0 is not None else "None"
         logger.debug(
             f"A(g) for '{attribute}': {score:.4f} (over {len(per_prompt_scores)} prompts) | "
-            f"mean p1={mean_p1:.3f} p0={mean_p0:.3f} mu1={mean_mu1:.3f} mu0={mean_mu0:.3f}"
+            f"mean p1={mean_p1:.3f} p0={mean_p0:.3f} mu1={mu1_str} mu0={mu0_str}"
         )
         return score
 

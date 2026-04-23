@@ -8,8 +8,8 @@ from typing import Any
 @dataclass
 class FoundAttribute:
     attribute: str
-    delta_rm: float
-    delta_j: float
+    delta_rm: float | None
+    delta_j: float | None
     amplification_score: float
     step_found: int
     step_last_survived: int

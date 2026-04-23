@@ -18,10 +18,10 @@ class AttributeMeta:
     planner_prompt: str | None = None
     planner_reasoning: str | None = None
     amplification_score: float = 0.0
-    amp_mean_p1: float = 0.0   # mean P(g=1) across prompts
-    amp_mean_p0: float = 0.0   # mean P(g=0) across prompts
-    amp_mean_mu1: float = 0.0  # mean E[reward | g=1] across prompts
-    amp_mean_mu0: float = 0.0  # mean E[reward | g=0] across prompts
+    amp_mean_p1: float = 0.0          # mean P(g=1) across prompts
+    amp_mean_p0: float = 0.0          # mean P(g=0) across prompts
+    amp_mean_mu1: float | None = None  # mean E[reward | g=1]; None if never any g=1 images
+    amp_mean_mu0: float | None = None  # mean E[reward | g=0]; None if never any g=0 images
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in self.__dict__.items() if v is not None}
@@ -69,7 +69,7 @@ class AttributeStats:
     def is_undesirable(self, use_outlier_removal: bool = False) -> bool:
         rm = self.delta_rm(use_outlier_removal)
         j = self.delta_j()
-        return rm is not None and j is not None and rm > 0 and j < 0
+        return rm is not None and j is not None and rm > 0 and j <= 0
 
     @property
     def amplification_score(self) -> float:

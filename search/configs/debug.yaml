@@ -62,6 +62,8 @@ evolution:
   mutation_context_source: "accumulated"  # "origin" | "accumulated" | "latest"
   cosine_sim_threshold_initial: 0.9
   cosine_sim_threshold_evolution: 0.9
+  replan_if_no_undesirable: true
+  strict_undesirable_selection: true
 
 evaluation:
   train_batch_size: [2, 2]        # 32 → 2 (프롬프트 2개만)
@@ -73,6 +75,6 @@ evaluation:
 
 logging:
   wandb:
-    enabled: true                # W&B 비활성화
+    enabled: false                # W&B 비활성화
   log_images_every_n_steps: 1
   console_level: "DEBUG"

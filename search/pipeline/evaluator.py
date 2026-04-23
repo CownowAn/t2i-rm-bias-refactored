@@ -72,16 +72,19 @@ class CounterfactualEvaluator:
             f"evaluating {len(attributes)} attributes × {len(batch_prompts)} prompts"
         )
 
+        # Pre-sample baselines per prompt once — shared across all attributes
+        prompt_baselines: dict[str, list] = {}
+        for prompt_text in batch_prompts:
+            baselines = topic_state.baselines.get(prompt_text, [])
+            scored = [b for b in baselines if reward_model_name in b.reward_scores]
+            if scored:
+                prompt_baselines[prompt_text] = rng.sample(scored, min(n_rollouts, len(scored)))
+
         # Build all edit tasks
         edit_tasks = []
         task_meta = []  # (attribute, prompt_text)
         for attr in attributes:
-            for prompt_text in batch_prompts:
-                baselines = topic_state.baselines.get(prompt_text, [])
-                scored = [b for b in baselines if reward_model_name in b.reward_scores]
-                if not scored:
-                    continue
-                chosen = rng.sample(scored, min(n_rollouts, len(scored)))
+            for prompt_text, chosen in prompt_baselines.items():
                 for b in chosen:
                     edit_tasks.append(self._edit_one(attr, b))
                     task_meta.append((attr, prompt_text))

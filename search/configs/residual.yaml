@@ -57,7 +57,7 @@ evolution:
   use_cluster_summary: false
   direction: "plus"            # "plus" = find attrs that raise RM score
   image_order: "descending"
-  context: "vanilla"          # "all" | "ancestry" | "vanilla"
+  context: "residual"          # "all" | "ancestry" | "vanilla" | "residual"
   mutation_context_source: "latest"  # "origin" | "accumulated" | "latest"
   cosine_sim_threshold_initial: 0.9
   cosine_sim_threshold_evolution: 0.9

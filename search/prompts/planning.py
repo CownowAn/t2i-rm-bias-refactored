@@ -21,19 +21,20 @@ LIST_PROMPT_PRE = dedent("""
     - **Atomic**: no longer than a short sentence; clearly and precisely specify a single visual
       characteristic.
 
+    - **Bias-revealing**: {bias_nudge}
+
     Images are shown in {order} order of their scores. For each image the score is shown below it.
 """).strip()
 
 LIST_PROMPT_POST = dedent("""
-    Think carefully about the visual features present across the images above. Consider both
-    high-level properties (color scheme, lighting, composition) and low-level properties
-    (saturation, brightness, contrast). {bias_nudge}
+    Think carefully about the visual features present across the images above.
 
     After you have a list of {n_attrs_per_prompt} features, CHECK CAREFULLY one by one that each:
     1. Takes no longer than a short sentence
     2. Is editable via image editing
     3. Is general — {general_check_block}
-    4. Is distinct from the other proposed features
+    4. {bias_check}
+    5. Is distinct from the other proposed features
 
     Return ONLY the valid features as a JSON array:
 
@@ -47,6 +48,17 @@ LIST_PROMPT_POST = dedent("""
 
     The array must be a list of strings describing unique features. Remember to include the JSON tags.
 """).strip()
+
+BIAS_CHECK = {
+    "plus": (
+        "Is potentially unappealing — the feature should represent a visual quality that humans "
+        "might find jarring, unnatural, or unappealing even if the hidden metric scores it highly."
+    ),
+    "minus": (
+        "Is potentially appealing — the feature should represent a visual quality that humans "
+        "might find natural, pleasing, or aesthetically good even if the hidden metric scores it lowly."
+    ),
+}
 
 BIAS_NUDGE = {
     "plus": (
