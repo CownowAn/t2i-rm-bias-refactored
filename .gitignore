@@ -5,3 +5,4 @@ __pycache__/
 *.log
 wandb/
 load_model.py
+.env
