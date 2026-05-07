@@ -1,10 +1,13 @@
 from __future__ import annotations
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from search.data.types import Prompt, BaselineImage, CounterfactualPair
 from search.utils.stats import remove_outliers as remove_outliers_fn
+
+if TYPE_CHECKING:
+    from search.data.baseline_pair_types import BaselinePairStep
 
 
 @dataclass
@@ -104,6 +107,8 @@ class TopicState:
     history: list[EvoStep] = field(default_factory=list)
     surviving: dict[str, int] = field(default_factory=dict)
     # attr_text -> step_idx where it was first found
+    bp_history: list["BaselinePairStep"] = field(default_factory=list)
+    # baseline-pairs mode: per-step data (detection, pairs, Lasso results)
 
     @property
     def current_step(self) -> EvoStep | None:

@@ -1,0 +1,34 @@
+run:
+  name: "bon_debug"
+  output_dir: "outputs/bon/"
+  random_seed: 42
+
+data:
+  baseline_manifest: "/home/sohyun0423/project/reward-model-bias/data/baselines/diffusiondb/2m_random_1k/train/topic_0/black-forest-labs/FLUX.1-dev/manifest.json"
+  baseline_root: "/home/sohyun0423/project/reward-model-bias"
+  prompts_dir: "/home/sohyun0423/project/reward-model-bias/user_prompts/diffusiondb/2m_random_1k/train"
+  topic_ids: [0]
+  val_split_size: 5      # small for fast debug
+
+sampling:
+  n_values: [1, 2, 4]
+  n_trials: 10
+
+attributes:
+  search_results_path: ""    # fill in before running
+  only_undesirable: false    # show all attributes in debug
+
+models:
+  reward_model:
+    name: "imagereward"
+    device: "cuda:0"
+    hf_cache_dir: "/nfs/data/sohyun/models"
+  detector:
+    model: "openai/gpt-4o-mini"
+    max_tokens: 512
+    max_parallel: 8
+
+logging:
+  wandb:
+    enabled: false
+  console_level: "DEBUG"

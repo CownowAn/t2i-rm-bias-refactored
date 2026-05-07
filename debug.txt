@@ -1,0 +1,8 @@
+Aggressive sharpening/high local contrast produces an over-crisp, slightly unnatural texture.
+
+
+0.00979193330537775 unnaturally enlarged, doll-like eyes with oversized irises relative to the face",
+0.006251251799697268 Strong specular highlights giving surfaces a glossy, plastic/wet look.
+0.0023 visible hatch-like blush streaks/line scratches on the cheek shading 
+0.0016965482254387419 excessive number of tightly packed jagged fangs/teeth filling the open mouth (crowded tooth rows)
+visible compositing halo/rim outline around the m

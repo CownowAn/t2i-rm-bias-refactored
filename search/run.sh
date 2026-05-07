@@ -7,4 +7,8 @@ FLUX_DEVICES=$(python3 -c "n=$N_GPUS; print('[' + ','.join(f'cuda:{i}' for i in 
 
 # python -m search.main --config search/configs/debug.yaml "models.editor.flux_devices=$FLUX_DEVICES"
 # python -m search.main --config search/configs/default.yaml "models.editor.flux_devices=$FLUX_DEVICES"
-python -m search.main --config search/configs/residual.yaml "models.editor.flux_devices=$FLUX_DEVICES"
+# python -m search.main --config search/configs/residual.yaml "models.editor.flux_devices=$FLUX_DEVICES"
+
+# ── Baseline-pairs mode (no FLUX needed) ──
+# python -m search.main --config search/configs/baseline_pairs_debug.yaml
+python -m search.main --config search/configs/baseline_pairs.yaml

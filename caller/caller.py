@@ -2,6 +2,8 @@
 Main Caller class.
 """
 
+import io
+import json
 import os
 import time
 import random
@@ -457,6 +459,121 @@ class OpenAICaller(CallerBaseClass):
         return self.openai_response_to_unified(response.model_dump())
 
 
+    async def call_batch(
+        self,
+        messages: "Sequence[ChatHistory]",
+        model: str,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        poll_interval: int = 60,
+        **kwargs,
+    ) -> "list[Response | None]":
+        """Submit requests to the OpenAI Batch API (50% price discount, async).
+
+        The method blocks (with asyncio.sleep) until the batch completes or fails.
+        Only Chat-Completions-compatible parameters are forwarded; reasoning and
+        other Responses-API-only params are intentionally ignored.
+
+        Args:
+            messages:      One ChatHistory per request.
+            model:         Model name WITHOUT the "openai/" prefix.
+            max_tokens:    Max output tokens per request.
+            temperature:   Sampling temperature.
+            poll_interval: Seconds between status-poll requests (default 60).
+
+        Returns:
+            list[Response | None] in the same order as *messages*.
+            None for individual requests that errored inside the batch.
+        """
+        if not messages:
+            return []
+
+        # ── 1. Build JSONL ────────────────────────────────────────────────────
+        cfg_kwargs: dict = {}
+        if max_tokens is not None:
+            cfg_kwargs["max_tokens"] = max_tokens
+        if temperature is not None:
+            cfg_kwargs["temperature"] = temperature
+
+        lines: list[str] = []
+        for i, msg in enumerate(messages):
+            request = Request(
+                model=model,
+                messages=msg if isinstance(msg, ChatHistory) else ChatHistory(messages=msg),
+                config=InferenceConfig(**cfg_kwargs),
+            )
+            lines.append(json.dumps(request.to_batch_item(f"req-{i}")))
+
+        jsonl_bytes = "\n".join(lines).encode("utf-8")
+
+        # ── 2. Upload input file ──────────────────────────────────────────────
+        logger.info(f"Uploading batch input file ({len(lines)} requests, {len(jsonl_bytes)} bytes) …")
+        file_obj = await self.client.files.create(
+            file=("batch_input.jsonl", io.BytesIO(jsonl_bytes), "application/jsonl"),
+            purpose="batch",
+        )
+        logger.info(f"Batch input file uploaded: {file_obj.id}")
+
+        # ── 3. Create batch job ───────────────────────────────────────────────
+        batch = await self.client.batches.create(
+            input_file_id=file_obj.id,
+            endpoint="/v1/chat/completions",
+            completion_window="24h",
+        )
+        logger.info(f"Batch job created: {batch.id} (status={batch.status})")
+
+        # ── 4. Poll until terminal state ──────────────────────────────────────
+        terminal = {"completed", "failed", "expired", "cancelled"}
+        while batch.status not in terminal:
+            await asyncio.sleep(poll_interval)
+            batch = await self.client.batches.retrieve(batch.id)
+            counts = batch.request_counts
+            logger.info(
+                f"Batch {batch.id}: status={batch.status}  "
+                f"completed={counts.completed}/{counts.total}  "
+                f"failed={counts.failed}"
+            )
+
+        if batch.status != "completed":
+            logger.error(f"Batch {batch.id} ended with status={batch.status!r}; returning None for all requests")
+            return [None] * len(messages)
+
+        # ── 5. Download and parse output ──────────────────────────────────────
+        output_bytes = await self.client.files.content(batch.output_file_id)
+        output_text = output_bytes.text
+
+        result_map: dict[str, "Response | None"] = {}
+        for line in output_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                logger.warning(f"Batch output: failed to parse JSONL line: {line[:120]}")
+                continue
+            custom_id: str = item.get("custom_id", "")
+            if item.get("error") or not item.get("response"):
+                logger.warning(f"Batch request {custom_id} failed: {item.get('error')}")
+                result_map[custom_id] = None
+                continue
+            resp_body = item["response"]["body"]
+            try:
+                result_map[custom_id] = Response.model_validate(resp_body)
+            except Exception as exc:
+                logger.warning(f"Batch request {custom_id}: response parse error: {exc}")
+                result_map[custom_id] = None
+
+        # ── 6. Best-effort cleanup of uploaded files ──────────────────────────
+        for fid in (file_obj.id, batch.output_file_id):
+            try:
+                await self.client.files.delete(fid)
+            except Exception:
+                pass
+
+        return [result_map.get(f"req-{i}") for i in range(len(messages))]
+
+
 class AnthropicCaller(CallerBaseClass):
     def __init__(
         self,
@@ -672,6 +789,27 @@ class AutoCaller:
                 return await caller.call_one(messages=messages, model=model, **kwargs)
             else:
                 raise ValueError(f"No caller was found that supports the given model {model}")
+
+    async def call_batch(
+        self,
+        messages: "Sequence[ChatHistory]",
+        model: str,
+        **kwargs,
+    ) -> "list[Response | None]":
+        """Submit requests via the OpenAI Batch API (50% discount).
+
+        Only supported for models with the "openai/" prefix. Raises ValueError otherwise.
+        See OpenAICaller.call_batch for full parameter documentation.
+        """
+        if not model.startswith("openai/"):
+            raise ValueError(
+                f"Batch API is only supported for OpenAI models (prefix 'openai/'). Got: {model!r}"
+            )
+        caller = self._get_caller("openai")
+        if caller is None:
+            raise ValueError("OpenAI caller is unavailable; check OPENAI_API_KEY in .env")
+        model_stripped = model.removeprefix("openai/")
+        return await caller.call_batch(messages=messages, model=model_stripped, **kwargs)
 
     async def shutdown(self) -> None:
         """Flush cache and close connections for all initialized sub-callers."""

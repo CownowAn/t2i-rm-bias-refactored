@@ -29,6 +29,21 @@ class SearchResults:
     cost_usd: float
     wall_time_seconds: float
 
+    @classmethod
+    def load(cls, path: Path | str) -> "SearchResults":
+        path = Path(path)
+        with open(path) as f:
+            data = json.load(f)
+        top_attributes = [FoundAttribute(**a) for a in data.get("top_attributes", [])]
+        return cls(
+            run_id=data["run_id"],
+            config_snapshot=data.get("config_snapshot", {}),
+            top_attributes=top_attributes,
+            n_steps_completed=data.get("n_steps_completed", 0),
+            cost_usd=data.get("cost_usd", 0.0),
+            wall_time_seconds=data.get("wall_time_seconds", 0.0),
+        )
+
     def save(self, path: Path | str) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)

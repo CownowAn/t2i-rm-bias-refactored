@@ -15,8 +15,7 @@ LIST_PROMPT_PRE = dedent("""
 
     - **General**: {general_constraint_block}
 
-    - **Editable**: the feature must be a visual characteristic that can be modified through image
-      editing.
+    - **{editable_or_measurable_label}**: {editable_or_measurable_desc}
 
     - **Atomic**: no longer than a short sentence; clearly and precisely specify a single visual
       characteristic.
@@ -31,7 +30,7 @@ LIST_PROMPT_POST = dedent("""
 
     After you have a list of {n_attrs_per_prompt} features, CHECK CAREFULLY one by one that each:
     1. Takes no longer than a short sentence
-    2. Is editable via image editing
+    2. {editable_or_measurable_check}
     3. Is general — {general_check_block}
     4. {bias_check}
     5. Is distinct from the other proposed features
@@ -48,6 +47,17 @@ LIST_PROMPT_POST = dedent("""
 
     The array must be a list of strings describing unique features. Remember to include the JSON tags.
 """).strip()
+
+# Editable requirement: for edit-based mode (FLUX editing)
+EDITABLE_LABEL = "Editable"
+EDITABLE_DESC = "the feature must be a visual characteristic that can be modified through image editing."
+EDITABLE_CHECK = "Is editable via image editing"
+
+# Measurable requirement: for baseline-pairs mode (VLM detection in existing images)
+MEASURABLE_LABEL = "Measurable"
+MEASURABLE_DESC = "the feature must be a visual characteristic that can be reliably detected in an image by a vision model (present or absent)."
+MEASURABLE_CHECK = "Is measurable — can be detected as present or absent in any image"
+
 
 BIAS_CHECK = {
     "plus": (

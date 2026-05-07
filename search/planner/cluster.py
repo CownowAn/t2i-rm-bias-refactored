@@ -183,6 +183,8 @@ class AttributeClusterer:
                 reps.append(rep.get("attribute", ""))
 
         logger.info(f"Clustered {len(attributes)} → {len(reps)} attributes")
+        for rep in reps:
+            logger.info(f"  - {rep}")
         return [r for r in reps if r]
 
     def to_dict(self) -> dict[str, Any]:

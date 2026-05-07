@@ -43,7 +43,7 @@ class AttributeMutator:
         n_residual_high: int = 3,
         n_residual_low: int = 1,
         n_residual_explained: int = 2,
-        lasso_min_pairs: int = 5,
+        reg_min_pairs: int = 5,
         mutation_context_source: str = "origin",
         use_cluster_summary: bool = False,
         use_outlier_removal: bool = False,
@@ -61,7 +61,7 @@ class AttributeMutator:
         self.n_residual_high = n_residual_high
         self.n_residual_low = n_residual_low
         self.n_residual_explained = n_residual_explained
-        self.lasso_min_pairs = lasso_min_pairs
+        self.reg_min_pairs = reg_min_pairs
         self.mutation_context_source = mutation_context_source
         self.use_cluster_summary = use_cluster_summary
         self.use_outlier_removal = use_outlier_removal
@@ -228,7 +228,7 @@ class AttributeMutator:
             # Compute Lasso residuals once per topic for residual context mode
             probing_result: LinearProbingResult | None = None
             if self.context == "residual":
-                probing_result = compute_lasso_residuals(last_step, min_pairs=self.lasso_min_pairs)
+                probing_result = compute_lasso_residuals(last_step, min_pairs=self.reg_min_pairs)
                 if probing_result is None:
                     logger.warning(
                         f"Topic {topic_state.topic_id}: sklearn unavailable, "
@@ -237,14 +237,14 @@ class AttributeMutator:
                 elif probing_result.fallback:
                     logger.warning(
                         f"Topic {topic_state.topic_id}: too few pairs "
-                        f"({probing_result.n_pairs} < {self.lasso_min_pairs}), "
+                        f"({probing_result.n_pairs} < {self.reg_min_pairs}), "
                         "falling back to vanilla context for this topic"
                     )
                 else:
                     logger.info(
-                        f"Topic {topic_state.topic_id}: Lasso fit — "
+                        f"Topic {topic_state.topic_id}: regression fit — "
                         f"R²={probing_result.variance_explained:.3f}, "
-                        f"α={probing_result.lasso_alpha:.4f}, "
+                        f"α={probing_result.reg_alpha:.4f}, "
                         f"N={probing_result.n_pairs}"
                     )
 

@@ -96,6 +96,42 @@ def load_baselines_from_manifest(
     )
 
 
+def load_val_topic_state(
+    prompts_dir: str | Path,
+    topic_id: int,
+    val_split_size: int = 40,
+    random_seed: int = 42,
+) -> TopicState:
+    """Load val split for a single topic using the same shuffle as load_topic_states()."""
+    from random import Random
+    prompts_dir = Path(prompts_dir)
+
+    cluster_path = prompts_dir / f"cluster_{topic_id}.json"
+    with open(cluster_path) as f:
+        data = json.load(f)
+
+    rng = Random(random_seed + topic_id)
+    all_prompts: list[str] = data["prompts"]
+
+    if len(all_prompts) < max(1, val_split_size):
+        raise ValueError(f"Not enough prompts for topic {topic_id}: {len(all_prompts)}")
+
+    rng.shuffle(all_prompts)
+    val_texts = all_prompts[-val_split_size:] if val_split_size > 0 else []
+
+    prompts = [Prompt(text=t, topic_id=topic_id) for t in val_texts]
+    state = TopicState(
+        topic_id=topic_id,
+        prompts=prompts,
+        cluster_summary=data.get("summary", ""),
+    )
+    logger.info(
+        f"Topic {topic_id}: loaded {len(val_texts)} val prompts\n"
+        f"  Summary: {data.get('summary', '')[:80]}"
+    )
+    return state
+
+
 async def score_baselines(
     topic_state: TopicState,
     reward_model: RewardModel,

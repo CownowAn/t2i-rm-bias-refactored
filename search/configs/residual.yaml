@@ -1,6 +1,6 @@
 run:
   name: null           # auto-generated as "{timestamp}" if null
-  output_dir: "outputs/"
+  output_dir: "outputs/search"
   random_seed: 42
 
 data:

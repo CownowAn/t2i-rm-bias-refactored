@@ -128,6 +128,36 @@ class ChatMessage(BaseModel):
                 "content": self.content,
             }
 
+    def to_cc_content(self) -> dict:
+        """Convert to Chat Completions format (for Batch API / OpenRouter).
+
+        Translates Responses-API content block types:
+          input_text  → text
+          input_image → image_url  (with nested {"url": ..., "detail": ...})
+        Other block types are passed through unchanged.
+        """
+        if isinstance(self.content, str):
+            return {"role": self.role, "content": self.content}
+        cc_blocks = []
+        for block in self.content:
+            if not isinstance(block, dict):
+                cc_blocks.append(block)
+                continue
+            btype = block.get("type")
+            if btype == "input_text":
+                cc_blocks.append({"type": "text", "text": block["text"]})
+            elif btype == "input_image":
+                cc_blocks.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": block["image_url"],
+                        "detail": block.get("detail", "auto"),
+                    },
+                })
+            else:
+                cc_blocks.append(block)
+        return {"role": self.role, "content": cc_blocks}
+
 
 class ToolMessage(BaseModel):
     role: Literal["tool"]
@@ -221,7 +251,11 @@ class ChatHistory(BaseModel):
 
     def to_openai_messages(self) -> list[dict]:
         return [msg.to_openai_content() for msg in self.messages]
-    
+
+    def to_chat_completions_messages(self) -> list[dict]:
+        """Convert to Chat Completions message format (for Batch API)."""
+        return [msg.to_cc_content() for msg in self.messages]
+
     def to_openai_str(self) -> str:
         return json.dumps(self.to_openai_messages(), indent=4)
 
@@ -306,6 +340,40 @@ class Request(BaseModel):
 
         request_body.update(config_dict)
         return request_body
+
+    def to_batch_item(self, custom_id: str) -> dict:
+        """Build one line of a Batch API JSONL input file (Chat Completions format).
+
+        Only parameters supported by Chat Completions are included.
+        Reasoning and Responses-API-only params are intentionally omitted.
+        """
+        if isinstance(self.messages, ChatHistory):
+            messages = self.messages.to_chat_completions_messages()
+        else:
+            messages = [msg.to_cc_content() for msg in self.messages]
+
+        body: dict = {"model": self.model, "messages": messages}
+        cfg = self.config
+        if cfg.max_tokens is not None:
+            body["max_tokens"] = cfg.max_tokens
+        if cfg.temperature is not None:
+            body["temperature"] = cfg.temperature
+        if cfg.top_p is not None:
+            body["top_p"] = cfg.top_p
+        if cfg.stop is not None:
+            body["stop"] = cfg.stop
+        if cfg.seed is not None:
+            body["seed"] = cfg.seed
+        if cfg.frequency_penalty is not None:
+            body["frequency_penalty"] = cfg.frequency_penalty
+        if cfg.presence_penalty is not None:
+            body["presence_penalty"] = cfg.presence_penalty
+        return {
+            "custom_id": custom_id,
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": body,
+        }
 
     def to_anthropic_request(self) -> dict:
         request_body = {"model": self.model}

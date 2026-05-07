@@ -9,7 +9,11 @@ from loguru import logger
 from caller import AutoCaller, ChatHistory, ChatMessage
 from search.data.state import TopicState, AttributeStats, AttributeMeta, EvoStep
 from search.data.types import BaselineImage
-from search.prompts.planning import PLANNER_SYSTEM, LIST_PROMPT_PRE, LIST_PROMPT_POST, BIAS_NUDGE, BIAS_CHECK
+from search.prompts.planning import (
+    PLANNER_SYSTEM, LIST_PROMPT_PRE, LIST_PROMPT_POST, BIAS_NUDGE, BIAS_CHECK,
+    EDITABLE_LABEL, EDITABLE_DESC, EDITABLE_CHECK,
+    MEASURABLE_LABEL, MEASURABLE_DESC, MEASURABLE_CHECK,
+)
 from search.utils.io import parse_json_response
 
 
@@ -31,6 +35,7 @@ class InitialPlanner:
         direction: str = "plus",
         order: str = "descending",
         random_seed: int = 42,
+        require_editable: bool = True,
     ):
         self.model_name = model_name
         self.reasoning = reasoning
@@ -45,6 +50,7 @@ class InitialPlanner:
         self.direction = direction
         self.order = order
         self.random_seed = random_seed
+        self.require_editable = require_editable
         self.caller = AutoCaller(dotenv_path=".env")
 
     async def plan(
@@ -111,7 +117,7 @@ class InitialPlanner:
 
                     if self.use_cluster_summary and topic_state.cluster_summary:
                         general_constraint_block = (
-                            "the feature must apply to images from ANY sensible text prompt "
+                            "the feature must be applicable to images from ANY sensible text prompt "
                             "in this cluster:\n"
                             "      <user_prompt_cluster_summary>\n"
                             f"      {topic_state.cluster_summary}\n"
@@ -124,6 +130,9 @@ class InitialPlanner:
                             "regardless of its specific subject or scene."
                         )
                         general_check_block = "applies to any image regardless of subject or scene"
+                    em_label = EDITABLE_LABEL if self.require_editable else MEASURABLE_LABEL
+                    em_desc  = EDITABLE_DESC  if self.require_editable else MEASURABLE_DESC
+                    em_check = EDITABLE_CHECK if self.require_editable else MEASURABLE_CHECK
                     pre_text = (
                         PLANNER_SYSTEM + "\n\n"
                         + LIST_PROMPT_PRE.format(
@@ -132,6 +141,8 @@ class InitialPlanner:
                             general_constraint_block=general_constraint_block,
                             order=self.order,
                             bias_nudge=BIAS_NUDGE[self.direction],
+                            editable_or_measurable_label=em_label,
+                            editable_or_measurable_desc=em_desc,
                         )
                         + f"\n\nUser prompt: {prompt_text}\n"
                     )
@@ -151,6 +162,7 @@ class InitialPlanner:
                         bias_nudge=BIAS_NUDGE[self.direction],
                         bias_check=BIAS_CHECK[self.direction],
                         general_check_block=general_check_block,
+                        editable_or_measurable_check=em_check,
                     )
                     content.append({"type": "input_text", "text": post_text})
 
@@ -186,12 +198,14 @@ class InitialPlanner:
                 continue
             meta = metas[i]
             attributes, reasoning = parse_json_response(resp)
-            if i < 3:
-                logger.info(f"InitialPlanner reasoning:\n{reasoning}")
+            if reasoning is not None:
+                logger.info(f"InitialPlanner reasoning -- topic {meta['topic_id']} (index {i}):\n{reasoning}")
             if not isinstance(attributes, list):
                 logger.warning(f"InitialPlanner: response not a list (topic={meta['topic_id']})")
                 continue
             attributes = [str(a).strip() for a in attributes if a]
+            if attributes:
+                logger.info(f"InitialPlanner: topic {meta['topic_id']} (index {i}) proposed attributes: {attributes}")
 
             ts = topic_state_by_id[meta["topic_id"]]
             sidx = 0 if target_step_idx is None else target_step_idx

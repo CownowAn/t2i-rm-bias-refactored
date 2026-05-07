@@ -138,7 +138,7 @@ class EvolutionEngine:
             context=config.evolution.context,
             direction=config.evolution.direction,
             random_seed=config.run.random_seed,
-            lasso_min_pairs=config.evolution.lasso_min_pairs,
+            reg_min_pairs=config.evolution.reg_min_pairs,
             mutation_context_source=config.evolution.mutation_context_source,
             use_cluster_summary=config.evolution.use_cluster_summary,
             use_outlier_removal=config.evaluation.use_outlier_removal,

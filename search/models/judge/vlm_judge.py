@@ -22,10 +22,14 @@ class VisionLLMJudge(JudgeModel):
         max_tokens: int = 50000,
         max_parallel: int = 32,
         random_seed: int = 42,
+        image_detail: str = "auto",
+        use_batch_api: bool = False,
     ):
         self._model_name = model_name
         self.max_tokens = max_tokens
         self.max_parallel = max_parallel
+        self.image_detail = image_detail
+        self.use_batch_api = use_batch_api
         self.rng = random.Random(random_seed)
         self.caller = AutoCaller(dotenv_path=".env")
 
@@ -55,9 +59,9 @@ class VisionLLMJudge(JudgeModel):
                 second_url = ChatMessage.image_to_base64_url(img_A if flip else img_B)
                 content = [
                     {"type": "input_text", "text": judge_template.format(prompt=prompt) + "\n\nImage A:"},
-                    {"type": "input_image", "image_url": first_url, "detail": "auto"},
+                    {"type": "input_image", "image_url": first_url, "detail": self.image_detail},
                     {"type": "input_text", "text": "Image B:"},
-                    {"type": "input_image", "image_url": second_url, "detail": "auto"},
+                    {"type": "input_image", "image_url": second_url, "detail": self.image_detail},
                 ]
                 chats.append(ChatHistory(messages=[ChatMessage(role="user", content=content)]))
             except Exception as e:
@@ -67,12 +71,20 @@ class VisionLLMJudge(JudgeModel):
         valid_idx = [i for i, c in enumerate(chats) if c is not None]
         resp_map: dict[int, Any] = {}
         if valid_idx:
-            responses = await self.caller.call(
-                messages=[chats[i] for i in valid_idx],
-                model=self._model_name,
-                max_parallel=self.max_parallel,
-                max_tokens=self.max_tokens,
-            )
+            valid_chats = [chats[i] for i in valid_idx]
+            if self.use_batch_api:
+                responses = await self.caller.call_batch(
+                    messages=valid_chats,
+                    model=self._model_name,
+                    max_tokens=self.max_tokens,
+                )
+            else:
+                responses = await self.caller.call(
+                    messages=valid_chats,
+                    model=self._model_name,
+                    max_parallel=self.max_parallel,
+                    max_tokens=self.max_tokens,
+                )
             for i, r in zip(valid_idx, responses):
                 resp_map[i] = r
 
@@ -115,10 +127,14 @@ class VisionLLMDetector(DetectorModel):
         model_name: str = "openai/gpt-4o-mini",
         max_tokens: int = 50000,
         max_parallel: int = 32,
+        image_detail: str = "auto",
+        use_batch_api: bool = False,
     ):
         self._model_name = model_name
         self.max_tokens = max_tokens
         self.max_parallel = max_parallel
+        self.image_detail = image_detail
+        self.use_batch_api = use_batch_api
         self.caller = AutoCaller(dotenv_path=".env")
 
     @property
@@ -143,7 +159,7 @@ class VisionLLMDetector(DetectorModel):
                 img_url = ChatMessage.image_to_base64_url(img_path)
                 content = [
                     {"type": "input_text", "text": detect_template.format(attribute=attribute, prompt=prompt) + "\n\nImage:"},
-                    {"type": "input_image", "image_url": img_url, "detail": "auto"},
+                    {"type": "input_image", "image_url": img_url, "detail": self.image_detail},
                 ]
                 chats.append(ChatHistory(messages=[ChatMessage(role="user", content=content)]))
             except Exception as e:
@@ -153,12 +169,20 @@ class VisionLLMDetector(DetectorModel):
         valid_idx = [i for i, c in enumerate(chats) if c is not None]
         resp_map: dict[int, Any] = {}
         if valid_idx:
-            responses = await self.caller.call(
-                messages=[chats[i] for i in valid_idx],
-                model=self._model_name,
-                max_parallel=self.max_parallel,
-                max_tokens=self.max_tokens,
-            )
+            valid_chats = [chats[i] for i in valid_idx]
+            if self.use_batch_api:
+                responses = await self.caller.call_batch(
+                    messages=valid_chats,
+                    model=self._model_name,
+                    max_tokens=self.max_tokens,
+                )
+            else:
+                responses = await self.caller.call(
+                    messages=valid_chats,
+                    model=self._model_name,
+                    max_parallel=self.max_parallel,
+                    max_tokens=self.max_tokens,
+                )
             for i, r in zip(valid_idx, responses):
                 resp_map[i] = r
 

@@ -1,7 +1,27 @@
 run:
-  name: "debug"
+  name: "bp-debug"
   output_dir: "outputs/search"
   random_seed: 42
+
+pipeline:
+  mode: "baseline_pairs"
+
+baseline_pairs:
+  n_pairs_per_prompt: 10     # used when pair_constructor="hamming"
+  use_judge: false           # skip judge for fast debug
+  judge_filter_position: "before_residual_select"
+  n_high_residual_pairs: 3
+  n_proposed_per_step: 4
+  reg_fit_intercept: true
+  pair_constructor: stratified
+  n_pairs_per_stratum: 2
+  use_mu_filter: true
+  use_amp_filter: false
+  detection_cache_path: null
+  regression_model: elasticnet
+  elasticnet_l1_ratio: [0.5, 1.0]
+  elasticnet_n_alphas: 20
+  elasticnet_cv: 3
 
 data:
   baseline_manifest: "/home/sohyun0423/project/reward-model-bias/data/baselines/diffusiondb/2m_random_1k/train/topic_0/black-forest-labs/FLUX.1-dev/manifest.json"
@@ -26,55 +46,59 @@ models:
     model: "openai/gpt-4o-mini"
     max_tokens: 1024
     max_parallel: 4
+    image_detail: "auto"
+    use_batch_api: false
 
   detector:
     model: "openai/gpt-4o-mini"
     max_tokens: 1024
-    max_parallel: 32
+    max_parallel: 8
+    image_detail: "auto"
+    use_batch_api: false
 
   planner:
-    model: "openai/gpt-4o-mini"  # gpt-5 대신 저렴한 모델
-    # model: "openai/gpt-5"  # gpt-5 대신 저렴한 모델
-    reasoning: "high"               # reasoning 비활성화
-    max_tokens: 10000
+    model: "openai/gpt-4o-mini"
+    reasoning: null
+    max_tokens: 4096
     max_parallel: 4
 
   cluster:
-    model: "openai/gpt-4o-mini"  # gpt-5.2 대신 저렴한 모델
+    model: "openai/gpt-4o-mini"
     max_tokens: 2048
-    reasoning: "high"
+    reasoning: null
     max_parallel: 1
 
 evolution:
-  n_steps: 2                      # 5 → 2
-  initial_pop_size: 2             # 8 → 2
-  target_pop_sizes: [2, 2]        # n_steps에 맞춤
+  n_steps: 2
+  initial_pop_size: 2          # humanness filter keeps up to 4 (×2)
+  target_pop_sizes: [2, 2]     # unused in bp mode but required by validation
   n_mutations: 1
-  n_context_imgs: 4               # 16 → 4
-  n_attrs_per_prompt: 2           # 4 → 2
+  n_context_imgs: 4
+  n_attrs_per_prompt: 2
   n_per_user_prompt: 1
-  n_initial_plan_prompts: 3             # 전체 train 프롬프트 중 3개만 사용
+  n_initial_plan_prompts: 3
   initial_context_sampling: "stratified"
   use_cluster_summary: false
   direction: "plus"
-  image_order: "descending"   # planner에게 이미지 보여주는 순서 (reward 높은 순)
-  context: "vanilla"              # ancestry → vanilla (이미지 로딩 최소화)
-  mutation_context_source: "accumulated"  # "origin" | "accumulated" | "latest"
+  image_order: "descending"
+  context: "vanilla"
+  mutation_context_source: "accumulated"
+  reg_min_pairs: 3
   cosine_sim_threshold_initial: 0.9
   cosine_sim_threshold_evolution: 0.9
-  replan_if_no_undesirable: true
-  strict_undesirable_selection: true
+  replan_if_no_undesirable: false
+  strict_undesirable_selection: false
 
 evaluation:
-  train_batch_size: [2, 2]        # 32 → 2 (프롬프트 2개만)
+  train_batch_size: [2, 2]
   n_rollouts_per_prompt: 1
   judge_first_n_rollouts: 1
-  amp_n_prompts: 2                # 32 → 2
-  amp_n_images_per_prompt: 4      # 64 → 4
+  amp_n_prompts: 2
+  amp_n_images_per_prompt: 8
   use_outlier_removal: false
 
 logging:
   wandb:
-    enabled: false                # W&B 비활성화
+    enabled: false
   log_images_every_n_steps: 1
   console_level: "DEBUG"

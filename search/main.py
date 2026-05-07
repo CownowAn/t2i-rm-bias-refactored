@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import shutil
 import sys
 from pathlib import Path
 
+import yaml
 from loguru import logger
 
 
@@ -34,6 +36,12 @@ async def main() -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logger.add(str(log_path), level="DEBUG", rotation="50 MB")
 
+    # Save the original config yaml and the effective config (with CLI overrides applied)
+    shutil.copy(args.config, log_path.parent / "config_source.yaml")
+    effective_config_path = log_path.parent / "config_effective.yaml"
+    with open(effective_config_path, "w") as f:
+        yaml.dump(config.to_dict(), f, default_flow_style=False, allow_unicode=True)
+
     logger.info(f"Run: {config.run.name}")
     logger.info(f"Output dir: {config.run_output_dir()}")
     logger.info(f"n_steps={config.evolution.n_steps}, direction={config.evolution.direction}")
@@ -49,8 +57,14 @@ async def main() -> None:
         output_dir=Path(config.run_output_dir()),
     )
 
-    from search.pipeline.evolution import EvolutionEngine
-    engine = EvolutionEngine.from_config(config, tracker=tracker)
+    if config.pipeline.mode == "edit":
+        from search.pipeline.evolution import EvolutionEngine
+        engine = EvolutionEngine.from_config(config, tracker=tracker)
+    elif config.pipeline.mode == "baseline_pairs":
+        from search.pipeline.baseline_evo import BaselinePairEvolutionEngine
+        engine = BaselinePairEvolutionEngine.from_config(config, tracker=tracker)
+    else:
+        raise ValueError(f"Unknown pipeline.mode: {config.pipeline.mode!r}")
 
     try:
         results = await engine.run()
