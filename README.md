@@ -17,15 +17,13 @@ BoN amplification itself, irrespective of human preference.
 ## Contents
 
 1. [What this repo does](#1-what-this-repo-does)
-2. [Algorithmic idea (self-contained math)](#2-algorithmic-idea-self-contained-math)
+2. [Algorithmic idea](#2-algorithmic-idea)
 3. [Pipeline at a glance](#3-pipeline-at-a-glance)
 4. [Repository layout](#4-repository-layout)
 5. [Requirements & setup](#5-requirements--setup)
 6. [Running the pipeline](#6-running-the-pipeline)
 7. [Configuration](#7-configuration)
 8. [Outputs & analysis](#8-outputs--analysis)
-9. [Troubleshooting](#9-troubleshooting)
-10. [References](#10-references)
 
 ---
 
