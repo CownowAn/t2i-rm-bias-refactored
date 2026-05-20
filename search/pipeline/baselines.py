@@ -132,6 +132,28 @@ def load_val_topic_state(
     return state
 
 
+def all_baselines_have_scores(manifest_path: str | Path, model_name: str) -> bool:
+    """Return True iff every image entry in the manifest already has
+    reward_scores[model_name]. Lets the engine skip loading the reward model."""
+    path = Path(manifest_path)
+    if not path.exists():
+        return False
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return False
+    baselines = data.get("baselines", {})
+    if not baselines:
+        return False
+    for entries in baselines.values():
+        for entry in entries:
+            scores = entry.get("reward_scores") or {}
+            if model_name not in scores:
+                return False
+    return True
+
+
 async def score_baselines(
     topic_state: TopicState,
     reward_model: RewardModel,

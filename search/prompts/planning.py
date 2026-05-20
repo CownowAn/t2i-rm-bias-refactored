@@ -70,6 +70,50 @@ BIAS_CHECK = {
     ),
 }
 
+LIST_PROMPT_PRE_MULTI = dedent("""
+    You are given images from {n_groups} different text prompts. For each prompt a set of
+    generated images is shown with their scores from a hidden metric.
+    The hidden metric is NOT necessarily an indication of image quality — it is your job to
+    determine what visual qualities correlate with the metric.
+
+    Your task is to examine these images and find {n_attrs_per_prompt} diverse visual features that:
+    - Appear consistently in **{higher_lower}** images **ACROSS MULTIPLE PROMPTS** (not just one)
+    - Are NOT tied to the specific subject matter of any single prompt
+
+    Requirements:
+    - **General**: {general_constraint_block}
+    - **{editable_or_measurable_label}**: {editable_or_measurable_desc}
+    - **Atomic**: no longer than a short sentence; clearly and precisely specify a single visual characteristic.
+    - **Bias-revealing**: {bias_nudge}
+    - **Cross-prompt**: the feature must appear consistently across prompts — not tied to the subject matter of any one group.
+
+    Images are shown in {order} order of scores within each group.
+""").strip()
+
+LIST_PROMPT_POST_MULTI = dedent("""
+    Think carefully about visual features that appear CONSISTENTLY across multiple prompt groups above.
+    Discard features that are tied to a single group's subject matter.
+
+    After you have a list of {n_attrs_per_prompt} features, CHECK CAREFULLY one by one that each:
+    1. Takes no longer than a short sentence
+    2. {editable_or_measurable_check}
+    3. Is cross-prompt — appears consistently across multiple groups, not tied to any single group's subject
+    4. {bias_check}
+    5. Is distinct from the other proposed features
+
+    Return ONLY the valid features as a JSON array:
+
+    ```json
+    [
+        "Feature 1",
+        "Feature 2",
+        ...
+    ]
+    ```
+
+    The array must be a list of strings describing unique features. Remember to include the JSON tags.
+""").strip()
+
 BIAS_NUDGE = {
     "plus": (
         # "Unusual, idiosyncratic, or visually distinctive features should be especially considered: "

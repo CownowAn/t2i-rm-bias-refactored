@@ -293,7 +293,11 @@ class OpenRouterCaller(CallerBaseClass):
         super().__init__(cache_config=cache_config, retry_config=retry_config)
         load_dotenv(dotenv_path)
         self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
-        self.client = AsyncOpenAI(api_key=self.api_key, base_url="https://openrouter.ai/api/v1")
+        self.client = AsyncOpenAI(
+            api_key=self.api_key,
+            base_url="https://openrouter.ai/api/v1",
+            timeout=1800.0,   # 30 min — reasoning models with many images can be slow
+        )
         if self.api_key is None:
             raise ValueError("api_key not provided and OPENROUTER_API_KEY not found in .env")
 
@@ -381,7 +385,10 @@ class OpenAICaller(CallerBaseClass):
         super().__init__(cache_config=cache_config, retry_config=retry_config)
         load_dotenv(dotenv_path)
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        self.client = AsyncOpenAI(api_key=self.api_key)
+        self.client = AsyncOpenAI(
+            api_key=self.api_key,
+            timeout=1800.0,   # 30 min — reasoning models with many images can be slow
+        )
         if self.api_key is None:
             raise ValueError("api_key not provided and OPENAI_API_KEY not found in .env")
 
@@ -504,72 +511,91 @@ class OpenAICaller(CallerBaseClass):
             )
             lines.append(json.dumps(request.to_batch_item(f"req-{i}")))
 
-        jsonl_bytes = "\n".join(lines).encode("utf-8")
+        # ── 2. Split into chunks ≤ MAX_FILE_BYTES (OpenAI limit: 100 MB) ──────
+        _MAX_FILE_BYTES = 90 * 1024 * 1024  # 90 MB safety margin
+        chunks: list[list[str]] = []
+        current: list[str] = []
+        current_bytes = 0
+        for line in lines:
+            lb = len(line.encode("utf-8")) + 1  # +1 for newline
+            if current and current_bytes + lb > _MAX_FILE_BYTES:
+                chunks.append(current)
+                current, current_bytes = [line], lb
+            else:
+                current.append(line)
+                current_bytes += lb
+        if current:
+            chunks.append(current)
 
-        # ── 2. Upload input file ──────────────────────────────────────────────
-        logger.info(f"Uploading batch input file ({len(lines)} requests, {len(jsonl_bytes)} bytes) …")
-        file_obj = await self.client.files.create(
-            file=("batch_input.jsonl", io.BytesIO(jsonl_bytes), "application/jsonl"),
-            purpose="batch",
+        logger.info(
+            f"Batch: {len(lines)} requests split into {len(chunks)} chunk(s) "
+            f"(limit={_MAX_FILE_BYTES // 1024 // 1024} MB each)"
         )
-        logger.info(f"Batch input file uploaded: {file_obj.id}")
 
-        # ── 3. Create batch job ───────────────────────────────────────────────
-        batch = await self.client.batches.create(
-            input_file_id=file_obj.id,
-            endpoint="/v1/chat/completions",
-            completion_window="24h",
-        )
-        logger.info(f"Batch job created: {batch.id} (status={batch.status})")
-
-        # ── 4. Poll until terminal state ──────────────────────────────────────
-        terminal = {"completed", "failed", "expired", "cancelled"}
-        while batch.status not in terminal:
-            await asyncio.sleep(poll_interval)
-            batch = await self.client.batches.retrieve(batch.id)
-            counts = batch.request_counts
-            logger.info(
-                f"Batch {batch.id}: status={batch.status}  "
-                f"completed={counts.completed}/{counts.total}  "
-                f"failed={counts.failed}"
+        # ── 3. Submit + poll + parse each chunk (concurrently) ────────────────
+        async def _run_chunk(chunk_lines: list[str]) -> dict[str, "Response | None"]:
+            jsonl_bytes = "\n".join(chunk_lines).encode("utf-8")
+            file_obj = await self.client.files.create(
+                file=("batch_input.jsonl", io.BytesIO(jsonl_bytes), "application/jsonl"),
+                purpose="batch",
             )
+            batch = await self.client.batches.create(
+                input_file_id=file_obj.id,
+                endpoint="/v1/chat/completions",
+                completion_window="24h",
+            )
+            logger.info(f"Batch chunk {batch.id}: {len(chunk_lines)} requests submitted")
 
-        if batch.status != "completed":
-            logger.error(f"Batch {batch.id} ended with status={batch.status!r}; returning None for all requests")
-            return [None] * len(messages)
+            terminal = {"completed", "failed", "expired", "cancelled"}
+            while batch.status not in terminal:
+                await asyncio.sleep(poll_interval)
+                batch = await self.client.batches.retrieve(batch.id)
+                counts = batch.request_counts
+                logger.info(
+                    f"Batch {batch.id}: status={batch.status}  "
+                    f"completed={counts.completed}/{counts.total}  failed={counts.failed}"
+                )
 
-        # ── 5. Download and parse output ──────────────────────────────────────
-        output_bytes = await self.client.files.content(batch.output_file_id)
-        output_text = output_bytes.text
+            partial: dict[str, "Response | None"] = {}
+            if batch.status != "completed":
+                logger.error(f"Batch {batch.id} ended with status={batch.status!r}")
+                for line in chunk_lines:
+                    cid = json.loads(line).get("custom_id", "")
+                    partial[cid] = None
+            else:
+                output_text = (await self.client.files.content(batch.output_file_id)).text
+                for line in output_text.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    cid = item.get("custom_id", "")
+                    if item.get("error") or not item.get("response"):
+                        logger.warning(f"Batch request {cid} failed: {item.get('error')}")
+                        partial[cid] = None
+                    else:
+                        try:
+                            partial[cid] = Response.model_validate(item["response"]["body"])
+                        except Exception as exc:
+                            logger.warning(f"Batch {cid}: parse error: {exc}")
+                            partial[cid] = None
+
+            for fid in (file_obj.id, getattr(batch, "output_file_id", None)):
+                if fid:
+                    try:
+                        await self.client.files.delete(fid)
+                    except Exception:
+                        pass
+            return partial
+
+        chunk_results = await asyncio.gather(*[_run_chunk(chunk) for chunk in chunks])
 
         result_map: dict[str, "Response | None"] = {}
-        for line in output_text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                logger.warning(f"Batch output: failed to parse JSONL line: {line[:120]}")
-                continue
-            custom_id: str = item.get("custom_id", "")
-            if item.get("error") or not item.get("response"):
-                logger.warning(f"Batch request {custom_id} failed: {item.get('error')}")
-                result_map[custom_id] = None
-                continue
-            resp_body = item["response"]["body"]
-            try:
-                result_map[custom_id] = Response.model_validate(resp_body)
-            except Exception as exc:
-                logger.warning(f"Batch request {custom_id}: response parse error: {exc}")
-                result_map[custom_id] = None
-
-        # ── 6. Best-effort cleanup of uploaded files ──────────────────────────
-        for fid in (file_obj.id, batch.output_file_id):
-            try:
-                await self.client.files.delete(fid)
-            except Exception:
-                pass
+        for partial in chunk_results:
+            result_map.update(partial)
 
         return [result_map.get(f"req-{i}") for i in range(len(messages))]
 
@@ -585,7 +611,10 @@ class AnthropicCaller(CallerBaseClass):
         super().__init__(cache_config=cache_config, retry_config=retry_config)
         load_dotenv(dotenv_path)
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
-        self.client = AsyncAnthropic(api_key=self.api_key)
+        self.client = AsyncAnthropic(
+            api_key=self.api_key,
+            timeout=1800.0,   # 30 min — reasoning models with many images can be slow
+        )
         if self.api_key is None:
             raise ValueError("api_key not provided and ANTHROPIC_API_KEY not found in .env")
 
@@ -828,10 +857,18 @@ class LocalCaller(CallerBaseClass):
     ):
         super().__init__(cache_config=cache_config, retry_config=retry_config)
         self.base_url = base_url
-        self.client = AsyncOpenAI(base_url=base_url, api_key="EMPTY")
+        self.client = AsyncOpenAI(
+            base_url=base_url,
+            api_key="EMPTY",
+            timeout=1800.0,   # 30 min — large batched detection requests can be slow
+        )
 
     async def _call(self, request: Request) -> Response:
         request_body = request.to_openrouter_request()
+        # vLLM uses Chat Completions format ("text"/"image_url"), not Responses API format
+        # ("input_text"/"input_image"). to_cc_content() handles this conversion.
+        if isinstance(request.messages, ChatHistory):
+            request_body["messages"] = request.messages.to_chat_completions_messages()
         request_body_to_pass = {k: v for k, v in request_body.items() if v is not None}
         try:
             chat_completion = await self.client.chat.completions.create(**request_body_to_pass)

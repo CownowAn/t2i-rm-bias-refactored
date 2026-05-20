@@ -1,0 +1,11 @@
+# Desirable visual attributes - to verify whether they explain most BoN rank variance.
+# One attribute per line. Lines starting with # are ignored.
+
+Single dominant subject is centered and fills most of the frame.
+Strong shallow depth of field with the subject sharp and background heavily blurred.
+Pronounced rim/back lighting that creates a bright outline glow on the subject's edges.
+Strong cool-warm complementary color grading (warm highlights against cool blue/teal shadows).
+The subject is sharply focused with crisp visible details.
+Bright soft circular bokeh highlights are visible in the background.
+Lighting clearly separates the subject from the background with a high subject-to-background brightness ratio.
+Composition is balanced and visually pleasing with the main subject framed naturally.

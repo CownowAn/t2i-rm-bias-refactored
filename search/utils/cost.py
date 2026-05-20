@@ -270,15 +270,26 @@ def estimate_cost_bp(config: "SearchConfig") -> dict[str, float]:
     # Total fixed baseline images (sampled once, reused every step)
     n_fixed_images = ecfg.amp_n_prompts * ecfg.amp_n_images_per_prompt
 
+    # Batch API discount (50%) applies to detector and judge when use_batch_api=True
+    _BATCH_DISCOUNT = 0.5
+    detector_discount = _BATCH_DISCOUNT if cfg.models.detector.use_batch_api else 1.0
+    judge_discount    = _BATCH_DISCOUNT if cfg.models.judge.use_batch_api    else 1.0
+
+    # Local vLLM detector → zero API cost
+    detector_is_local = bool(cfg.models.detector.vllm_base_url)
+
     # Per-call costs
     humanness_call = _call_cost(planner_model,
                                 _HUMANNESS_TEXT_TOK, _HUMANNESS_OUTPUT_TOK)
-    detect_call    = _call_cost(detector_model,
-                                _JUDGE_DETECT_TEXT_TOK + img_tok_detector,
-                                _JUDGE_DETECT_OUT_TOK)
+    detect_call = (
+        0.0 if detector_is_local
+        else _call_cost(detector_model,
+                        _JUDGE_DETECT_TEXT_TOK + img_tok_detector,
+                        _JUDGE_DETECT_OUT_TOK) * detector_discount
+    )
     judge_call     = _call_cost(judge_model,
                                 _JUDGE_COMPARE_TEXT_TOK + 2 * img_tok_judge,
-                                _JUDGE_COMPARE_OUT_TOK)
+                                _JUDGE_COMPARE_OUT_TOK) * judge_discount
     proposer_call  = _call_cost(planner_model,
                                 _PROPOSER_TEXT_TOK + 2 * img_tok_planner,
                                 _PROPOSER_OUTPUT_TOK)
@@ -333,14 +344,29 @@ def estimate_cost_bp(config: "SearchConfig") -> dict[str, float]:
             cost_detection += n_attrs_in * n_fixed_images * detect_call
 
             # [3] Judge — one call per pair, 2 images per call
-            #     Stratified constructor produces ≈ n_pairs_per_stratum × amp_n_prompts pairs
-            #     (global quota adapts with K, but total stays ≈ constant)
+            #     Number of pairs judged depends on pair_constructor AND judge_filter_position.
             if bpcfg.use_judge:
-                n_pairs = bpcfg.n_pairs_per_stratum * ecfg.amp_n_prompts
-                cost_judge += n_pairs * judge_call
+                if bpcfg.judge_filter_position == "lazy":
+                    # lazy: judge top-residual pairs until n_high_residual_pairs × overshoot confirmed.
+                    # Actual judged count depends on judge pass rate; assume ~20% pass rate as
+                    # a conservative upper bound (5× more pairs judged than confirmed target).
+                    n_confirmed_target = int(bpcfg.n_high_residual_pairs * bpcfg.judge_lazy_overshoot)
+                    n_judged = n_confirmed_target * 5
+                elif bpcfg.pair_constructor == "all":
+                    # all valid (high, low) pairs where D[i,:]≠0.
+                    # Upper bound: C(amp_n_images_per_prompt, 2) × amp_n_prompts / 2
+                    # (÷2 for RM(high)>RM(low) direction; assume most pairs have D≠0)
+                    n_img = ecfg.amp_n_images_per_prompt
+                    n_judged = n_img * (n_img - 1) // 2 * ecfg.amp_n_prompts // 2
+                elif bpcfg.pair_constructor == "hamming":
+                    n_judged = bpcfg.n_pairs_per_prompt * ecfg.amp_n_prompts
+                else:  # stratified
+                    # Global quota ≈ n_pairs_per_stratum × amp_n_prompts (constant across K)
+                    n_judged = bpcfg.n_pairs_per_stratum * ecfg.amp_n_prompts
+                cost_judge += n_judged * judge_call
 
             # [4] Residual proposer — n_proposed_per_step calls, each with 2 images
-            #     Skipped on the final step (no EXPAND after last EVALUATE)
+            #     Skipped on the final step (EXPAND runs but proposal is omitted)
             if step_idx < n_steps - 1:
                 cost_proposer += bpcfg.n_proposed_per_step * proposer_call
 
@@ -356,20 +382,175 @@ def estimate_cost_bp(config: "SearchConfig") -> dict[str, float]:
     }
 
 
+def estimate_cost_ba(config: "SearchConfig") -> dict[str, float]:
+    """
+    Estimate total API cost (USD) for a bon_amplified search run.
+
+    Components per topic per step:
+      1. Planner    — InitialPlanner at step 0
+      2. Cluster    — AttributeClusterer at step 0
+      3. Humanness  — filter_by_humanness: text-only, planner model
+                      Applied twice: after InitialPlanner AND after VLM propose
+      4. Detection  — VisionLLMDetector: 1 image per (new_attr × fixed_baseline_image)
+                      $0 if vllm_base_url is set (local inference)
+      5. Proposer   — BonResidualProposer: 1 call with n_prompts_vlm × 2 images (P+/P-)
+      6. Validation — detect proposed candidates + compute A_hat (same rate as detection)
+                      $0 if vllm_base_url is set
+    """
+    cfg = config
+    ecfg = cfg.evaluation
+    evcfg = cfg.evolution
+    bacfg = cfg.bon_amplified
+    n_steps = evcfg.n_steps
+
+    planner_model     = cfg.models.planner.model
+    attr_filter_model = cfg.models.attr_filter.model
+    proposer_model    = cfg.models.proposer.model
+    detector_model    = cfg.models.detector.model
+    cluster_model     = cfg.models.cluster.model
+
+    img_tok_detector = _img_tok(detector_model, _BASELINE_IMG_W, _BASELINE_IMG_H,
+                                detail=cfg.models.detector.image_detail)
+    img_tok_planner  = _img_tok(planner_model,  _BASELINE_IMG_W, _BASELINE_IMG_H)
+    img_tok_proposer = _img_tok(proposer_model, _BASELINE_IMG_W, _BASELINE_IMG_H,
+                                detail=cfg.models.proposer.image_detail)
+
+    n_fixed_images = ecfg.amp_n_prompts * ecfg.amp_n_images_per_prompt
+
+    detector_is_local = bool(cfg.models.detector.vllm_base_url)
+    _BATCH_DISCOUNT = 0.5
+    detector_discount = _BATCH_DISCOUNT if cfg.models.detector.use_batch_api else 1.0
+
+    detect_call = (
+        0.0 if detector_is_local
+        else _call_cost(detector_model,
+                        _JUDGE_DETECT_TEXT_TOK + img_tok_detector,
+                        _JUDGE_DETECT_OUT_TOK) * detector_discount
+    )
+    humanness_call = _call_cost(attr_filter_model, _HUMANNESS_TEXT_TOK, _HUMANNESS_OUTPUT_TOK)
+
+    # BonResidualProposer: 1 call, showing n_prompts_vlm prompts each with P+ + P- images
+    n_proposer_imgs = bacfg.n_prompts_vlm * bacfg.n_top_residual * 2
+    proposer_call = _call_cost(
+        proposer_model,
+        _PROPOSER_TEXT_TOK + n_proposer_imgs * img_tok_proposer,
+        bacfg.n_proposals * 15,  # ~15 tokens per proposed attr string
+    )
+
+    n_train_prompts_by_topic = _load_n_train_prompts(cfg)
+
+    cost_planner   = 0.0
+    cost_cluster   = 0.0
+    cost_humanness = 0.0
+    cost_detection = 0.0
+    cost_proposer  = 0.0
+    cost_validation = 0.0
+
+    for tid in cfg.data.topic_ids:
+        n_train = n_train_prompts_by_topic[tid]
+        n_effective = (
+            min(n_train, evcfg.n_initial_plan_prompts)
+            if evcfg.n_initial_plan_prompts is not None
+            else n_train
+        )
+
+        # ── Step 0: Initial Planning + Cluster ──────────────────────────────────
+        n_ppc = evcfg.n_prompts_per_plan_call  # prompts per VLM call
+        if n_ppc > 1:
+            # Multi-prompt mode: ceil(n_effective / n_ppc) calls, each showing
+            # n_ppc prompts × n_context_imgs images
+            n_planner_calls = math.ceil(n_effective / n_ppc)
+            planner_in_tok  = n_ppc * evcfg.n_context_imgs * img_tok_planner + _PLANNER_TEXT_STEP0
+        else:
+            n_planner_calls = n_effective * evcfg.n_per_user_prompt
+            planner_in_tok  = evcfg.n_context_imgs * img_tok_planner + _PLANNER_TEXT_STEP0
+        cost_planner += n_planner_calls * _call_cost(
+            planner_model, planner_in_tok, _PLANNER_OUTPUT_TOK
+        )
+        n_raw_attrs = n_planner_calls * evcfg.n_attrs_per_prompt
+        cost_cluster += _call_cost(
+            cluster_model, n_raw_attrs * _CLUSTER_ATTR_TOK, _CLUSTER_OUTPUT_TOK
+        )
+
+        # ── Main loop ─────────────────────────────────────────────────────────
+        for step_idx in range(n_steps):
+            # Attrs entering EVALUATE:
+            #   step 0: initial pool (post-cluster + humanness from SETUP)
+            #   step k>0: S_{t-1} (survived) + validated candidates from step k-1
+            if step_idx == 0:
+                n_attrs_in = min(n_raw_attrs, evcfg.initial_pop_size * 2)
+            else:
+                top_k = evcfg.target_pop_sizes[step_idx - 1]
+                n_attrs_in = top_k + bacfg.n_proposals  # S_{t-1} + new validated
+
+            # [1] Humanness filter on SETUP (step 0 only) — already applied before main loop;
+            #     included once in the step 0 humanness budget
+            # [1] Humanness on EVALUATE candidates (but these were already filtered in EXPAND)
+            #     → Only counts the EXPAND humanness call (n_proposals text calls)
+            if step_idx == 0:
+                # SETUP humanness on initial pool
+                cost_humanness += n_attrs_in * humanness_call
+            else:
+                # EXPAND humanness from previous step (n_proposals candidates)
+                cost_humanness += bacfg.n_proposals * humanness_call
+
+            # [2] Detection — only NEW attrs (S_{t-1} already cached; new = validated from EXPAND)
+            n_new_attrs = n_attrs_in if step_idx == 0 else bacfg.n_proposals
+            cost_detection += n_new_attrs * n_fixed_images * detect_call
+
+            # [3] Proposer + Validation (skipped on last step)
+            if step_idx < n_steps - 1:
+                cost_proposer += proposer_call * bacfg.n_proposer_calls
+                # Validation: detect all proposed candidates on all fixed images
+                cost_validation += bacfg.n_proposals * bacfg.n_proposer_calls * n_fixed_images * detect_call
+
+    total = (cost_planner + cost_cluster + cost_humanness
+             + cost_detection + cost_proposer + cost_validation)
+    return {
+        "planner":    cost_planner,
+        "cluster":    cost_cluster,
+        "humanness":  cost_humanness,
+        "detection":  cost_detection,
+        "proposer":   cost_proposer,
+        "validation": cost_validation,
+        "total":      total,
+        "detector_is_local": detector_is_local,
+    }
+
+
 def log_cost_estimate(config: "SearchConfig") -> None:
     """Print a formatted cost estimate breakdown to the logger."""
     from loguru import logger
 
     if config.pipeline.mode == "baseline_pairs":
         breakdown = estimate_cost_bp(config)
+        det_local = bool(config.models.detector.vllm_base_url)
+        det_note = " [local vLLM, $0]" if det_local else ""
         lines = [
             "── Estimated API Cost (baseline-pairs) ────────────",
             f"  Planner   (step 0 initial plan):  ${breakdown['planner']:>8.2f}",
             f"  Cluster   (deduplication):        ${breakdown['cluster']:>8.2f}",
             f"  Humanness (undesirability filter):${breakdown['humanness']:>8.2f}",
-            f"  Detection (VLM attr detection):   ${breakdown['detection']:>8.2f}",
+            f"  Detection (VLM attr detection):   ${breakdown['detection']:>8.2f}{det_note}",
             f"  Judge     (pair comparison):      ${breakdown['judge']:>8.2f}",
             f"  Proposer  (residual attr proposal):${breakdown['proposer']:>8.2f}",
+            "  ──────────────────────────────────────────────────",
+            f"  TOTAL                             ${breakdown['total']:>8.2f}",
+            "────────────────────────────────────────────────────",
+        ]
+    elif config.pipeline.mode == "bon_amplified":
+        breakdown = estimate_cost_ba(config)
+        det_local = breakdown["detector_is_local"]
+        det_note = " [local vLLM, $0]" if det_local else ""
+        val_note = " [local vLLM, $0]" if det_local else ""
+        lines = [
+            "── Estimated API Cost (bon-amplified) ─────────────",
+            f"  Planner    (step 0 initial plan): ${breakdown['planner']:>8.2f}",
+            f"  Cluster    (deduplication):       ${breakdown['cluster']:>8.2f}",
+            f"  Humanness  (undesir. filter ×2):  ${breakdown['humanness']:>8.2f}",
+            f"  Detection  (VLM attr detection):  ${breakdown['detection']:>8.2f}{det_note}",
+            f"  Proposer   (P+/P- VLM mining):    ${breakdown['proposer']:>8.2f}",
+            f"  Validation (A_hat check):         ${breakdown['validation']:>8.2f}{val_note}",
             "  ──────────────────────────────────────────────────",
             f"  TOTAL                             ${breakdown['total']:>8.2f}",
             "────────────────────────────────────────────────────",

@@ -7,10 +7,11 @@ from typing import Any
 
 from loguru import logger
 
-from caller import AutoCaller, ChatHistory, ChatMessage
+from caller import AutoCaller, LocalCaller, ChatHistory, ChatMessage
+from caller.cache import CacheConfig
 from search.models.base import JudgeModel, DetectorModel, ComparisonResult
 from search.prompts.judging import IMAGE_JUDGE_SYSTEM, IMAGE_JUDGE_PROMPT
-from search.prompts.detection import ATTRIBUTE_DETECTION_SYSTEM, ATTRIBUTE_DETECTION_PROMPT
+from search.prompts.detection import ATTRIBUTE_DETECTION_SYSTEM, build_detection_prompt
 
 
 class VisionLLMJudge(JudgeModel):
@@ -24,6 +25,7 @@ class VisionLLMJudge(JudgeModel):
         random_seed: int = 42,
         image_detail: str = "auto",
         use_batch_api: bool = False,
+        cache_config: CacheConfig | None = None,
     ):
         self._model_name = model_name
         self.max_tokens = max_tokens
@@ -31,7 +33,7 @@ class VisionLLMJudge(JudgeModel):
         self.image_detail = image_detail
         self.use_batch_api = use_batch_api
         self.rng = random.Random(random_seed)
-        self.caller = AutoCaller(dotenv_path=".env")
+        self.caller = AutoCaller(dotenv_path=".env", cache_config=cache_config)
 
     @property
     def model_name(self) -> str:
@@ -129,13 +131,32 @@ class VisionLLMDetector(DetectorModel):
         max_parallel: int = 32,
         image_detail: str = "auto",
         use_batch_api: bool = False,
+        vllm_base_url: str | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        presence_penalty: float | None = None,
+        extra_body: dict | None = None,
+        use_prompt: bool = True,
+        use_reasoning: bool = True,
+        cache_config: CacheConfig | None = None,
     ):
         self._model_name = model_name
         self.max_tokens = max_tokens
         self.max_parallel = max_parallel
         self.image_detail = image_detail
         self.use_batch_api = use_batch_api
-        self.caller = AutoCaller(dotenv_path=".env")
+        self.vllm_base_url = vllm_base_url
+        self.temperature = temperature
+        self.top_p = top_p
+        self.presence_penalty = presence_penalty
+        self.extra_body = extra_body
+        self.use_prompt = use_prompt
+        self.use_reasoning = use_reasoning
+        self.caller = (
+            LocalCaller(base_url=vllm_base_url, cache_config=cache_config)
+            if vllm_base_url
+            else AutoCaller(dotenv_path=".env", cache_config=cache_config)
+        )
 
     @property
     def model_name(self) -> str:
@@ -151,17 +172,33 @@ class VisionLLMDetector(DetectorModel):
         if len(image_paths) != len(prompts):
             raise ValueError("image_paths and prompts must have the same length")
 
-        detect_template = ATTRIBUTE_DETECTION_SYSTEM + "\n\n" + ATTRIBUTE_DETECTION_PROMPT
-
         chats: list[ChatHistory | None] = []
         for img_path, prompt in zip(image_paths, prompts):
             try:
                 img_url = ChatMessage.image_to_base64_url(img_path)
-                content = [
-                    {"type": "input_text", "text": detect_template.format(attribute=attribute, prompt=prompt) + "\n\nImage:"},
-                    {"type": "input_image", "image_url": img_url, "detail": self.image_detail},
-                ]
-                chats.append(ChatHistory(messages=[ChatMessage(role="user", content=content)]))
+                user_text = build_detection_prompt(
+                    attribute=attribute,
+                    prompt=prompt,
+                    use_prompt=self.use_prompt,
+                    use_reasoning=self.use_reasoning,
+                )
+                if self.vllm_base_url:
+                    # vLLM (e.g. Qwen): separate system msg, image before text
+                    content = [
+                        {"type": "input_image", "image_url": img_url},
+                        {"type": "input_text", "text": user_text},
+                    ]
+                    history = ChatHistory(messages=[
+                        ChatMessage(role="system", content=ATTRIBUTE_DETECTION_SYSTEM),
+                        ChatMessage(role="user", content=content),
+                    ])
+                else:
+                    content = [
+                        {"type": "input_text", "text": ATTRIBUTE_DETECTION_SYSTEM + "\n\n" + user_text + "\n\nImage:"},
+                        {"type": "input_image", "image_url": img_url, "detail": self.image_detail},
+                    ]
+                    history = ChatHistory(messages=[ChatMessage(role="user", content=content)])
+                chats.append(history)
             except Exception as e:
                 logger.error(f"Failed to build detection chat for {img_path}: {e}")
                 chats.append(None)
@@ -182,6 +219,10 @@ class VisionLLMDetector(DetectorModel):
                     model=self._model_name,
                     max_parallel=self.max_parallel,
                     max_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    presence_penalty=self.presence_penalty,
+                    extra_body=self.extra_body,
                 )
             for i, r in zip(valid_idx, responses):
                 resp_map[i] = r

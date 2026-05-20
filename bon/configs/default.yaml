@@ -21,22 +21,36 @@ attributes:
   only_undesirable: true
   # Option B: explicit list (overrides search_results_path when non-empty)
   # attributes: ["high saturation", "sharp edges", "warm color tone"]
-  attributes: ["dead-center framing with near-perfect bilateral symmetry of the main subject (static, mirror-like composition)", "unnaturally vivid, high-saturation eye irises (digitally enhanced eye color)", "aggressive HDR-style tone mapping / clarity boost that creates unnaturally high local contrast and crunchy textures", "exaggerated doll-like facial proportions (very large eyes with a small nose/mouth)"]
+  attributes: ["At least one visible eye contains two or more clearly separated white catchlights/reflection shapes (not counting tiny spark-like particles).", "Numerous small bright particle/spark-like specks are scattered around the focal area.", "In images with a human/character face, facial specular highlights (on cheeks/forehead/nose) appear as one or a few broad, smooth highlight patches rather than many small, broken-up glints.", "At least one visible eye is drawn in a doll/anime proportion where the iris occupies most of the eye opening and only a thin rim of white sclera is visible."]
 
 models:
   reward_model:
-    name: "imagereward"
+    name: "imagereward"  # "imagereward" | "pickscore" | "hpsv3"
     device: "cuda:0"
     hf_cache_dir: "/nfs/data/sohyun/models"
   detector:
     model: "openai/gpt-4o-mini"
-    max_tokens: 512
+    model: "Qwen/Qwen3.5-9B"
+    max_tokens: 1024
     max_parallel: 32
+    image_detail: "auto"   # "auto" | "high" | "low"
+    use_batch_api: false   # true → OpenAI Batch API (50% discount, blocks until complete)
+    # vLLM local serving: null = cloud API, "http://localhost:8000/v1" = local vLLM server
+    vllm_base_url: http://localhost:8000/v1
+    temperature: 0.7
+    top_p: 0.8
+    presence_penalty: 1.5
+    extra_body:
+      top_k: 20
+      chat_template_kwargs:
+        enable_thinking: false
+    use_prompt: false      # include image generation prompt in detection query
+    use_reasoning: false   # request reasoning field in JSON response (false = faster)
 
 logging:
   wandb:
     enabled: true
     project: "t2i-rm-bias-bon"
     entity: null
-    tags: ["bon", "imagereward"]
+    tags: ["bon", "pickscore"]
   console_level: "INFO"

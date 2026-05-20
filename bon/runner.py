@@ -43,18 +43,36 @@ class BonRunner:
 
     @classmethod
     def from_config(cls, config: "BonConfig", tracker: "BonTracker") -> "BonRunner":
-        from search.models.reward.imagereward import ImageRewardModel
-        from search.models.judge.vlm_judge import VisionLLMDetector
+        from search.models.detector import build_detector
+        from search.pipeline.baselines import all_baselines_have_scores
 
-        reward_model = ImageRewardModel(
-            device=config.models.reward_model.device,
-            hf_cache_dir=config.models.reward_model.hf_cache_dir,
-        )
-        detector = VisionLLMDetector(
-            model_name=config.models.detector.model,
-            max_tokens=config.models.detector.max_tokens,
-            max_parallel=config.models.detector.max_parallel,
-        )
+        rm_name = config.models.reward_model.name
+        if all_baselines_have_scores(config.data.baseline_manifest, rm_name):
+            from search.models.reward.noop import NoOpRewardModel
+            logger.info(
+                f"All baselines already scored with '{rm_name}' — "
+                f"skipping reward model load (using NoOpRewardModel)"
+            )
+            reward_model = NoOpRewardModel(name=rm_name)
+        elif rm_name == "pickscore":
+            from search.models.reward.pickscore import PickScoreModel
+            reward_model = PickScoreModel(
+                device=config.models.reward_model.device,
+                hf_cache_dir=config.models.reward_model.hf_cache_dir,
+            )
+        elif rm_name == "hpsv3":
+            from search.models.reward.hpsv3 import HPSv3Model
+            reward_model = HPSv3Model(
+                device=config.models.reward_model.device,
+                hf_cache_dir=config.models.reward_model.hf_cache_dir,
+            )
+        else:
+            from search.models.reward.imagereward import ImageRewardModel
+            reward_model = ImageRewardModel(
+                device=config.models.reward_model.device,
+                hf_cache_dir=config.models.reward_model.hf_cache_dir,
+            )
+        detector = build_detector(config.models.detector)
         return cls(config=config, reward_model=reward_model, detector=detector, tracker=tracker)
 
     async def run(self) -> list[BonResults]:
@@ -142,16 +160,29 @@ class BonRunner:
         run_cache_path: Path,
     ) -> dict[str, dict[str, bool]]:
         """
-        Two-level detection cache:
-        - global: shared across all runs at outputs/bon/cache/topic{N}.json
-        - run snapshot: what this specific run used at {run_output_dir}/detection_cache_topic{N}.json
+        Two-level detection cache keyed by "{model}::{image_detail}" at the top level,
+        so results from different detector configs never collide.
+
+        - global: shared across runs at outputs/bon/cache/{data.name}/topic{N}.json
+        - run snapshot: this run's subset at {run_output_dir}/detection_cache_topic{N}.json
         """
+        detector_cfg = self.config.models.detector
+        model_key = f"{detector_cfg.model}::{detector_cfg.image_detail}"
+
+        # ── Load matching entries from global cache ───────────────────────────
         cache: dict[str, dict[str, bool]] = {}
+        all_on_disk: dict = {}
         if global_cache_path.exists():
-            with open(global_cache_path) as f:
-                raw = json.load(f)
-            cache = {img_id: {k: bool(v) for k, v in attrs.items()} for img_id, attrs in raw.items()}
-            logger.info(f"Loaded global cache: {len(cache)} images ({global_cache_path})")
+            try:
+                with open(global_cache_path) as f:
+                    all_on_disk = json.load(f)
+            except Exception as e:
+                logger.warning(f"Could not read global cache at {global_cache_path}: {e}")
+            saved = all_on_disk.get(model_key, {})
+            cache = {img_id: {k: bool(v) for k, v in attrs.items()} for img_id, attrs in saved.items()}
+            logger.info(
+                f"Loaded global cache [{model_key}]: {len(cache)} images ({global_cache_path})"
+            )
 
         all_images = [img for imgs in baselines_by_prompt.values() for img in imgs]
         global_cache_dirty = False
@@ -175,14 +206,28 @@ class BonRunner:
                 cache.setdefault(img.image_id, {})[attr] = bool(det)
             global_cache_dirty = True
 
+        # ── Persist to global cache (merge under model_key) ──────────────────
         if global_cache_dirty:
-            _atomic_json_write(global_cache_path, cache)
-            logger.info(f"Updated global cache: {len(cache)} images → {global_cache_path}")
+            model_cache = all_on_disk.setdefault(model_key, {})
+            for img_id, attr_vals in cache.items():
+                model_cache.setdefault(img_id, {}).update(attr_vals)
+            _atomic_json_write(global_cache_path, all_on_disk)
+            n_entries = sum(len(v) for v in model_cache.values())
+            logger.info(
+                f"Updated global cache [{model_key}]: {len(model_cache)} images, "
+                f"{n_entries} attr entries → {global_cache_path}"
+            )
 
+        # ── Save run snapshot (same keyed structure) ──────────────────────────
         used_ids = {img.image_id for img in all_images}
-        run_snapshot = {img_id: attrs for img_id, attrs in cache.items() if img_id in used_ids}
+        run_snapshot = {
+            model_key: {img_id: attrs for img_id, attrs in cache.items() if img_id in used_ids}
+        }
         _atomic_json_write(run_cache_path, run_snapshot)
-        logger.info(f"Saved run cache snapshot: {len(run_snapshot)} images → {run_cache_path}")
+        logger.info(
+            f"Saved run cache snapshot [{model_key}]: "
+            f"{len(run_snapshot[model_key])} images → {run_cache_path}"
+        )
 
         return cache
 

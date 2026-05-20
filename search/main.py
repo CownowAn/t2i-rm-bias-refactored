@@ -63,6 +63,9 @@ async def main() -> None:
     elif config.pipeline.mode == "baseline_pairs":
         from search.pipeline.baseline_evo import BaselinePairEvolutionEngine
         engine = BaselinePairEvolutionEngine.from_config(config, tracker=tracker)
+    elif config.pipeline.mode == "bon_amplified":
+        from search.pipeline.bon_amplified_evo import BonAmplifiedEvolutionEngine
+        engine = BonAmplifiedEvolutionEngine.from_config(config, tracker=tracker)
     else:
         raise ValueError(f"Unknown pipeline.mode: {config.pipeline.mode!r}")
 

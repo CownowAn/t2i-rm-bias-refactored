@@ -6,3 +6,10 @@ __pycache__/
 wandb/
 load_model.py
 .env
+torchinductor_sohyun0423/
+test_detection.py
+OVERVIEW.md
+search/NEW_SEARCH_ALGO.md
+.vscode/
+amplification.md
+.env

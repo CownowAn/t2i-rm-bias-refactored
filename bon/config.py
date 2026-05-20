@@ -86,6 +86,14 @@ class BonConfig:
         assert self.sampling.n_values, "sampling.n_values must be non-empty"
         assert all(n >= 1 for n in self.sampling.n_values), "all n_values must be >= 1"
         assert self.sampling.n_trials >= 1, "sampling.n_trials must be >= 1"
+        assert self.models.reward_model.name in ("imagereward", "pickscore", "hpsv3"), (
+            f"models.reward_model.name must be 'imagereward', 'pickscore', or 'hpsv3', "
+            f"got {self.models.reward_model.name!r}"
+        )
+        assert self.models.detector.image_detail in ("auto", "high", "low"), (
+            f"models.detector.image_detail must be 'auto', 'high', or 'low', "
+            f"got {self.models.detector.image_detail!r}"
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

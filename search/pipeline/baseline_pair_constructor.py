@@ -286,3 +286,76 @@ class AttributeStratifiedPairConstructor:
             f"  → {N} pairs total from {n_attrs_contributed}/{K} attrs"
         )
         return all_pairs
+
+
+class AllPairConstructor:
+    """Uses ALL valid (high, low) image pairs within each prompt where at least one
+    attr in acc_pool differs between the two images (D[i,:] ≠ 0).
+
+    No quota or stratum-based selection — every informative pair is included.
+    Pairs with identical detection vectors (D[i,:] = 0) are excluded since they
+    contribute no information to the regression.
+
+    Deduplication is by (high_image_id, low_image_id); the same image can appear
+    in many pairs but each directed pair is counted once.
+    """
+
+    def construct(
+        self,
+        baselines_by_prompt: dict[str, list["BaselineImage"]],
+        detection: dict[str, dict[str, int]],
+        attr_pool: list[str],
+        reward_model_name: str,
+    ) -> list["BaselinePair"]:
+        all_pairs: list[BaselinePair] = []
+        seen: set[tuple[str, str]] = set()
+        K = len(attr_pool)
+        n_skipped_no_diff = 0
+
+        for images in baselines_by_prompt.values():
+            scored = [
+                img for img in images
+                if reward_model_name in img.reward_scores
+                and img.image_id in detection
+            ]
+            if len(scored) < 2:
+                continue
+
+            rm = {img.image_id: img.reward_scores[reward_model_name] for img in scored}
+            det = {img.image_id: detection[img.image_id] for img in scored}
+
+            for i in range(len(scored)):
+                for j in range(i + 1, len(scored)):
+                    a, b = scored[i], scored[j]
+                    r_a, r_b = rm[a.image_id], rm[b.image_id]
+                    if r_a == r_b:
+                        continue
+                    high, low = (a, b) if r_a > r_b else (b, a)
+                    pair_key = (high.image_id, low.image_id)
+                    if pair_key in seen:
+                        continue
+
+                    # Keep only pairs where at least one attr differs (D[i,:] ≠ 0)
+                    det_h = det[high.image_id]
+                    det_l = det[low.image_id]
+                    has_diff = any(
+                        det_h.get(attr, 0) != det_l.get(attr, 0)
+                        for attr in attr_pool
+                    )
+                    if not has_diff:
+                        n_skipped_no_diff += 1
+                        continue
+
+                    seen.add(pair_key)
+                    all_pairs.append(BaselinePair(
+                        high_reward=high,
+                        low_reward=low,
+                        delta_rm=abs(r_a - r_b),
+                    ))
+
+        logger.info(
+            f"AllPairConstructor: {len(all_pairs)} pairs from "
+            f"{len(baselines_by_prompt)} prompts  "
+            f"(K={K}, skipped {n_skipped_no_diff} zero-diff pairs)"
+        )
+        return all_pairs

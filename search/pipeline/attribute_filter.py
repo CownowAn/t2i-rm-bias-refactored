@@ -7,6 +7,7 @@ import numpy as np
 from loguru import logger
 
 from caller import AutoCaller, ChatHistory, ChatMessage
+from caller.cache import CacheConfig
 
 if TYPE_CHECKING:
     from search.data.types import BaselineImage
@@ -26,11 +27,12 @@ Respond with exactly one word: YES or NO."""
 class AttributeUndesirabilityFilter:
     """Filters attribute candidates by humanness and μ1 > μ0 reward criterion."""
 
-    def __init__(self, model_name: str, max_tokens: int = 4096, max_parallel: int = 8):
+    def __init__(self, model_name: str, max_tokens: int = 4096, max_parallel: int = 8,
+                 cache_config: CacheConfig | None = None):
         self.model_name = model_name
         self.max_tokens = max_tokens
         self.max_parallel = max_parallel
-        self.caller = AutoCaller(dotenv_path=".env")
+        self.caller = AutoCaller(dotenv_path=".env", cache_config=cache_config)
 
     async def filter_by_humanness(self, attr_names: list[str]) -> list[str]:
         """Keep only attributes that LLM judges as undesirable for human viewers."""

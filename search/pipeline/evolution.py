@@ -67,7 +67,8 @@ class EvolutionEngine:
         tracker: "ExperimentTracker",
     ) -> "EvolutionEngine":
         from search.models.reward.imagereward import ImageRewardModel
-        from search.models.judge.vlm_judge import VisionLLMJudge, VisionLLMDetector
+        from search.models.judge.vlm_judge import VisionLLMJudge
+        from search.models.detector import build_detector
         from search.models.editor.instruction_gen import EditInstructionGenerator
         from search.models.editor.flux_kontext import FluxKontextApplier
         from search.utils.async_utils import GpuApplierPool
@@ -83,11 +84,7 @@ class EvolutionEngine:
             max_parallel=config.models.judge.max_parallel,
         )
 
-        detector_model = VisionLLMDetector(
-            model_name=config.models.detector.model,
-            max_tokens=config.models.detector.max_tokens,
-            max_parallel=config.models.detector.max_parallel,
-        )
+        detector_model = build_detector(config.models.detector)
 
         instruction_gen = EditInstructionGenerator(
             model_name=config.models.editor.instruction_model,

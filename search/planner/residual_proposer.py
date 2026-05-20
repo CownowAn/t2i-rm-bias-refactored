@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from loguru import logger
 
 from caller import AutoCaller, ChatHistory, ChatMessage
+from caller.cache import CacheConfig
 
 if TYPE_CHECKING:
     from search.data.baseline_pair_types import BaselinePair
@@ -71,13 +72,14 @@ class ResidualAttributeProposer:
         max_tokens: int = 1024,
         max_parallel: int = 8,
         use_cluster_summary: bool = False,
+        cache_config: CacheConfig | None = None,
     ):
         self.model_name = model_name
         self.reasoning = reasoning
         self.max_tokens = max_tokens
         self.max_parallel = max_parallel
         self.use_cluster_summary = use_cluster_summary
-        self.caller = AutoCaller(dotenv_path=".env")
+        self.caller = AutoCaller(dotenv_path=".env", cache_config=cache_config)
 
     async def propose(
         self,

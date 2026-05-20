@@ -1,0 +1,56 @@
+run:
+  name: null             # auto-generated as bon_{timestamp}
+  output_dir: "outputs/bon/"
+  random_seed: 42
+
+data:
+  name: "mjhq"
+  baseline_manifest: "/nfs/data/sohyun/projects/t2i-rm-bias/data/baselines/mjhq/topic_0/black-forest-labs-FLUX.1-dev/manifest.json"
+  baseline_root: ""
+  prompts_dir: "clustering/output/mjhq"
+  topic_ids: [0]
+  val_split_size: 40     # must match the search run that produced search_results_path
+
+sampling:
+  n_values: [1, 2, 4, 8, 16, 32, 64, 128]
+  n_trials: 100
+
+attributes:
+  # Option A: load from a search run (attributes list takes precedence if both set)
+  search_results_path: "/home/sohyun0423/project/t2i-rm-bias/outputs/search/20260518-234932/results.json"
+  only_undesirable: false
+  # Option B: explicit list (overrides search_results_path when non-empty)
+  # attributes: ["high saturation", "sharp edges", "warm color tone"]
+  attributes: []
+
+models:
+  reward_model:
+    name: "pickscore"  # "imagereward" | "pickscore" | "hpsv3"
+    device: "cuda:0"
+    hf_cache_dir: "/nfs/data/sohyun/models"
+  detector:
+    # model: "openai/gpt-4o-mini"
+    model: "Qwen/Qwen3.5-9B"
+    max_tokens: 1024
+    max_parallel: 32
+    image_detail: "auto"   # "auto" | "high" | "low"
+    use_batch_api: false   # true → OpenAI Batch API (50% discount, blocks until complete)
+    # vLLM local serving: null = cloud API, "http://localhost:8000/v1" = local vLLM server
+    vllm_base_url: http://localhost:8000/v1
+    temperature: 0.7
+    top_p: 0.8
+    presence_penalty: 1.5
+    extra_body:
+      top_k: 20
+      chat_template_kwargs:
+        enable_thinking: false
+    use_prompt: false      # include image generation prompt in detection query
+    use_reasoning: false   # request reasoning field in JSON response (false = faster)
+
+logging:
+  wandb:
+    enabled: true
+    project: "t2i-rm-bias-bon"
+    entity: null
+    tags: ["bon", "pickscore"]
+  console_level: "INFO"

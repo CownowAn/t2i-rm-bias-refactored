@@ -8,6 +8,7 @@ from search.utils.stats import remove_outliers as remove_outliers_fn
 
 if TYPE_CHECKING:
     from search.data.baseline_pair_types import BaselinePairStep
+    from search.data.bon_amplified_types import BonAmplifiedStep
 
 
 @dataclass
@@ -109,6 +110,8 @@ class TopicState:
     # attr_text -> step_idx where it was first found
     bp_history: list["BaselinePairStep"] = field(default_factory=list)
     # baseline-pairs mode: per-step data (detection, pairs, Lasso results)
+    ba_history: list["BonAmplifiedStep"] = field(default_factory=list)
+    # bon-amplified mode: per-step data (detection, residuals, amp scores)
 
     @property
     def current_step(self) -> EvoStep | None:

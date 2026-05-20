@@ -42,6 +42,7 @@ from search.pipeline.attribute_filter import AttributeUndesirabilityFilter
 from search.pipeline.baseline_pair_constructor import (
     BaselinePairConstructor,
     AttributeStratifiedPairConstructor,
+    AllPairConstructor,
 )
 from search.planner.residual_proposer import ResidualAttributeProposer
 from search.utils.linear_probing import compute_regression_residuals_from_matrix
@@ -101,22 +102,32 @@ class BaselinePairEvolutionEngine:
         config: "SearchConfig",
         tracker: "ExperimentTracker",
     ) -> "BaselinePairEvolutionEngine":
-        from search.models.reward.imagereward import ImageRewardModel
-        from search.models.judge.vlm_judge import VisionLLMDetector, VisionLLMJudge
+        from search.models.judge.vlm_judge import VisionLLMJudge
+        from search.models.detector import build_detector
         from search.planner.initial import InitialPlanner
         from search.planner.cluster import AttributeClusterer
 
-        reward_model = ImageRewardModel(
-            device=config.models.reward_model.device,
-            hf_cache_dir=config.models.reward_model.hf_cache_dir,
-        )
-        detector_model = VisionLLMDetector(
-            model_name=config.models.detector.model,
-            max_tokens=config.models.detector.max_tokens,
-            max_parallel=config.models.detector.max_parallel,
-            image_detail=config.models.detector.image_detail,
-            use_batch_api=config.models.detector.use_batch_api,
-        )
+        rm_name = config.models.reward_model.name
+        if rm_name == "pickscore":
+            from search.models.reward.pickscore import PickScoreModel
+            reward_model = PickScoreModel(
+                device=config.models.reward_model.device,
+                hf_cache_dir=config.models.reward_model.hf_cache_dir,
+            )
+        elif rm_name == "hpsv3":
+            from search.models.reward.hpsv3 import HPSv3Model
+            reward_model = HPSv3Model(
+                device=config.models.reward_model.device,
+                hf_cache_dir=config.models.reward_model.hf_cache_dir,
+            )
+        else:
+            from search.models.reward.imagereward import ImageRewardModel
+            reward_model = ImageRewardModel(
+                device=config.models.reward_model.device,
+                hf_cache_dir=config.models.reward_model.hf_cache_dir,
+            )
+        cache_config = config.caller_cache.build()
+        detector_model = build_detector(config.models.detector, cache_config=cache_config)
         judge_model = (
             VisionLLMJudge(
                 model_name=config.models.judge.model,
@@ -124,6 +135,7 @@ class BaselinePairEvolutionEngine:
                 max_parallel=config.models.judge.max_parallel,
                 image_detail=config.models.judge.image_detail,
                 use_batch_api=config.models.judge.use_batch_api,
+                cache_config=cache_config,
             )
             if config.baseline_pairs.use_judge
             else None
@@ -132,12 +144,15 @@ class BaselinePairEvolutionEngine:
             model_name=config.models.planner.model,
             max_tokens=config.models.planner.max_tokens,
             max_parallel=config.models.planner.max_parallel,
+            cache_config=cache_config,
         )
         bp_cfg = config.baseline_pairs
         if bp_cfg.pair_constructor == "stratified":
             pair_constructor = AttributeStratifiedPairConstructor(
                 n_pairs_per_stratum=bp_cfg.n_pairs_per_stratum,
             )
+        elif bp_cfg.pair_constructor == "all":
+            pair_constructor = AllPairConstructor()
         else:
             pair_constructor = BaselinePairConstructor(
                 n_pairs_per_prompt=bp_cfg.n_pairs_per_prompt,
@@ -148,6 +163,7 @@ class BaselinePairEvolutionEngine:
             max_tokens=config.models.planner.max_tokens,
             max_parallel=config.models.planner.max_parallel,
             use_cluster_summary=config.evolution.use_cluster_summary,
+            cache_config=cache_config,
         )
         initial_planner = InitialPlanner(
             model_name=config.models.planner.model,
@@ -164,6 +180,7 @@ class BaselinePairEvolutionEngine:
             order=config.evolution.image_order,
             random_seed=config.run.random_seed,
             require_editable=False,  # baseline-pairs: VLM detection, not FLUX editing
+            cache_config=cache_config,
         )
         clusterer = AttributeClusterer(
             model_name=config.models.cluster.model,
@@ -252,10 +269,9 @@ class BaselinePairEvolutionEngine:
             if any_evaluated:
                 n_steps_completed += 1
 
-            if step_idx < cfg.evolution.n_steps - 1:
-                logger.info(f"=== Step {step_idx}: EXPAND ===")
-                for ts in self.topic_states:
-                    await self._expand_step(ts, step_idx, reward_name, bp_cfg)
+            logger.info(f"=== Step {step_idx}: EXPAND ===")
+            for ts in self.topic_states:
+                await self._expand_step(ts, step_idx, reward_name, bp_cfg)
 
         from search.utils.cost import estimate_cost_bp
         estimated_cost = estimate_cost_bp(cfg)["total"]
@@ -318,6 +334,18 @@ class BaselinePairEvolutionEngine:
             f"({len(cache)} images, {n_loaded} attr entries)"
         )
 
+        rejected_key = f"_rejected::{model_key}::{topic_id}"
+        saved_rejected: list[str] = all_saved.get(rejected_key, [])
+        existing_rejected = set(self._rejected_pool[topic_id])
+        added = 0
+        for attr in saved_rejected:
+            if attr not in existing_rejected:
+                self._rejected_pool[topic_id].append(attr)
+                existing_rejected.add(attr)
+                added += 1
+        if added:
+            logger.info(f"Topic {topic_id}: loaded {added} rejected attrs from cache [{model_key}]")
+
     def _save_detection_cache(self, topic_id: int, path: Path, model_key: str) -> None:
         """Persist the in-memory detection cache for model_key to disk (merge with existing)."""
         cache = self._detection_cache[topic_id]
@@ -333,13 +361,19 @@ class BaselinePairEvolutionEngine:
         model_cache = all_existing.setdefault(model_key, {})
         for image_id, attr_vals in cache.items():
             model_cache.setdefault(image_id, {}).update(attr_vals)
+        rejected_key = f"_rejected::{model_key}::{topic_id}"
+        existing_rejected = set(all_existing.get(rejected_key, []))
+        existing_rejected.update(self._rejected_pool[topic_id])
+        all_existing[rejected_key] = sorted(existing_rejected)
+
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             json.dump(all_existing, f)
         n_entries = sum(len(v) for v in model_cache.values())
         logger.debug(
             f"Topic {topic_id}: saved detection cache [{model_key}] → {path} "
-            f"({len(model_cache)} images, {n_entries} attr entries)"
+            f"({len(model_cache)} images, {n_entries} attr entries, "
+            f"{len(existing_rejected)} rejected attrs)"
         )
 
     # ── EVALUATE ──────────────────────────────────────────────────────────────
@@ -385,7 +419,8 @@ class BaselinePairEvolutionEngine:
                 f"  [B] Detecting {len(new_attrs_to_detect)} new attrs in {n_images} images"
             )
             new_det = await _detect_all_attributes(
-                self.detector_model, new_attrs_to_detect, fixed_baselines
+                self.detector_model, new_attrs_to_detect, fixed_baselines,
+                existing_cache=detection_cache,
             )
             # Merge into cumulative cache
             for image_id, attr_vals in new_det.items():
@@ -415,7 +450,9 @@ class BaselinePairEvolutionEngine:
 
         # [D] A(g) for current attrs using detection_cache (no extra VLM calls)
         amp_scores = _compute_amp_from_detection(
-            detection_cache, fixed_baselines, attr_pool, reward_name
+            detection_cache, fixed_baselines, attr_pool, reward_name,
+            amp_mode=bp_cfg.amp_mode,
+            bon_n=bp_cfg.amp_bon_n,
         )
 
         # [E] A(g) > 0 filter (optional) then top-K selection
@@ -433,12 +470,16 @@ class BaselinePairEvolutionEngine:
                 logger.warning(f"Topic {ts.topic_id} step {step_idx}: all attrs failed A(g)>0 filter")
                 return False
 
-        pop_size = (
-            cfg.evolution.target_pop_sizes[step_idx]
-            if step_idx < len(cfg.evolution.target_pop_sizes)
-            else cfg.evolution.target_pop_sizes[-1]
-        )
-        selected = sorted(attr_pool, key=lambda a: amp_scores.get(a, 0.0), reverse=True)[:pop_size]
+        if bp_cfg.select_all_passing:
+            # Include every filter-passing attr in acc_pool (no top-K cap).
+            selected = sorted(attr_pool, key=lambda a: amp_scores.get(a, 0.0), reverse=True)
+        else:
+            pop_size = (
+                cfg.evolution.target_pop_sizes[step_idx]
+                if step_idx < len(cfg.evolution.target_pop_sizes)
+                else cfg.evolution.target_pop_sizes[-1]
+            )
+            selected = sorted(attr_pool, key=lambda a: amp_scores.get(a, 0.0), reverse=True)[:pop_size]
         _trim_step(step, selected)
 
         # [F] Update engine-level acc_pool (dedup, preserve order)
@@ -480,11 +521,17 @@ class BaselinePairEvolutionEngine:
         ))
 
         # [I] Log EVALUATE phase
+        acc_pool_amp_scores = {
+            attr: self._all_found[(attr, ts.topic_id)].amplification_score
+            for attr in acc_pool
+            if (attr, ts.topic_id) in self._all_found
+        }
         self.tracker.log_bp_evaluate(
             step_idx=step_idx,
             topic_id=ts.topic_id,
             new_attrs=selected,
             amp_scores=amp_scores,
+            acc_pool_amp_scores=acc_pool_amp_scores,
             acc_pool_size=len(acc_pool),
             humanness_failed=sorted(humanness_failed),
             mu_failed_stats=mu_failed_stats,
@@ -567,6 +614,17 @@ class BaselinePairEvolutionEngine:
         bp_step.reg_alpha = reg_result.reg_alpha
         bp_step.reg_l1_ratio = reg_result.l1_ratio
         bp_step.residuals = residuals_vec
+        bp_step.reg_var_explained = reg_result.variance_explained
+        bp_step.reg_n_pairs = len(pairs)
+        bp_step.reg_residual_mean_abs = float(np.mean(np.abs(residuals_vec)))
+        bp_step.reg_residual_max_abs = float(np.max(np.abs(residuals_vec)))
+
+        # before_regression: D and pairs are already aligned (judge ran before D was built)
+        attr_delta_j: dict[str, float | None] = (
+            _compute_attr_delta_j(D, pairs, acc_pool)
+            if bp_cfg.use_judge and bp_cfg.judge_filter_position == "before_regression"
+            else {}
+        )
 
         # Update delta_rm in _all_found from regression weights
         for k, attr in enumerate(acc_pool):
@@ -587,37 +645,141 @@ class BaselinePairEvolutionEngine:
             judge_passed = await self._judge_filter_pairs(bp_step.pairs)
             passed_ids = {id(p) for p in judge_passed}
             kept_idx = [i for i, p in enumerate(bp_step.pairs) if id(p) in passed_ids]
+            # before_residual_select: compute delta_j BEFORE pairs is updated.
+            # _judge_filter_pairs sets pair.delta_j on ALL evaluated pairs (passed and failed),
+            # and D is still aligned with the full bp_step.pairs at this point.
+            attr_delta_j = _compute_attr_delta_j(D, bp_step.pairs, acc_pool)
             bp_step.pairs = [bp_step.pairs[i] for i in kept_idx]
             if bp_step.residuals is not None:
                 bp_step.residuals = bp_step.residuals[kept_idx]
             _log_attr_stats_after_judge(bp_step.pairs, acc_pool, detection_cache, ts.topic_id)
 
-        # [D] Select high-residual pairs
-        high_res_pairs = _select_high_residual_pairs(bp_step, bp_cfg.n_high_residual_pairs)
+        # [B] Judge — lazy position: prompt-diverse candidate selection + judge until target confirmed.
+        # Builds a round-robin interleaved candidate order across prompts so that no single prompt
+        # monopolises the judged set. Within each prompt, pairs are ordered by |residual| descending.
+        lazy_high_res_pairs: list | None = None
+        if (bp_cfg.use_judge and self.judge_model is not None and bp_step.pairs
+                and bp_cfg.judge_filter_position == "lazy"):
+            n_confirmed_target = int(bp_cfg.n_high_residual_pairs * bp_cfg.judge_lazy_overshoot)
+            batch_size = n_confirmed_target
 
-        # [E] LLM proposes new attrs — full acc_pool + rejected pool as context
-        proposed, diverse_pairs = await self.residual_proposer.propose(
-            topic_state=ts,
-            high_residual_pairs=high_res_pairs,
-            current_pool=acc_pool,
-            detection=detection_cache,
-            n_proposed=bp_cfg.n_proposed_per_step,
-            avoid_attrs=self._rejected_pool[ts.topic_id],
+            # Build prompt → [pair_idx, ...] mapping, sorted by |residual| desc within each prompt
+            from collections import defaultdict as _dd
+            prompt_to_idxs: dict[str, list[int]] = _dd(list)
+            for i, pair in enumerate(bp_step.pairs):
+                prompt_to_idxs[pair.high_reward.prompt.text].append(i)
+
+            prompt_cap = bp_cfg.judge_lazy_prompt_cap  # None = unlimited
+            sorted_prompt_lists: list[list[int]] = []
+            for idxs in prompt_to_idxs.values():
+                idxs_sorted = sorted(idxs, key=lambda i: abs(float(bp_step.residuals[i])), reverse=True)
+                if prompt_cap is not None:
+                    idxs_sorted = idxs_sorted[:prompt_cap]
+                sorted_prompt_lists.append(idxs_sorted)
+
+            # Round-robin interleave: each round takes the next-best pair from every prompt
+            diverse_idx: list[int] = []
+            max_len = max((len(lst) for lst in sorted_prompt_lists), default=0)
+            for k in range(max_len):
+                for lst in sorted_prompt_lists:
+                    if k < len(lst):
+                        diverse_idx.append(lst[k])
+
+            confirmed: list = []
+            n_judged = 0
+            offset = 0
+            while len(confirmed) < n_confirmed_target and offset < len(diverse_idx):
+                batch_end = min(offset + batch_size, len(diverse_idx))
+                batch = [bp_step.pairs[i] for i in diverse_idx[offset:batch_end]]
+                confirmed.extend(await self._judge_filter_pairs(batch))
+                n_judged += len(batch)
+                offset = batch_end
+
+            # delta_j is set in-place on all judged pairs; compute attr_delta_j from full pairs
+            attr_delta_j = _compute_attr_delta_j(D, bp_step.pairs, acc_pool)
+
+            # Final selection: (δj<0, |residual|) priority + optional per-prompt cap
+            n_final = bp_cfg.n_high_residual_pairs
+            per_prompt_cap = bp_cfg.n_high_residual_per_prompt
+            pair_to_res = {
+                id(p): abs(float(bp_step.residuals[i]))
+                for i, p in enumerate(bp_step.pairs)
+            }
+            sorted_confirmed = sorted(
+                confirmed,
+                key=lambda p: (p.delta_j is not None and p.delta_j < 0,
+                               pair_to_res.get(id(p), 0.0)),
+                reverse=True,
+            )
+            if per_prompt_cap is None:
+                lazy_high_res_pairs = sorted_confirmed[:n_final]
+            else:
+                prompt_counts_sel: dict[str, int] = {}
+                lazy_high_res_pairs = []
+                for pair in sorted_confirmed:
+                    pt = pair.high_reward.prompt.text
+                    if prompt_counts_sel.get(pt, 0) < per_prompt_cap:
+                        lazy_high_res_pairs.append(pair)
+                        prompt_counts_sel[pt] = prompt_counts_sel.get(pt, 0) + 1
+                    if len(lazy_high_res_pairs) >= n_final:
+                        break
+
+            n_prompts_judged = len({bp_step.pairs[i].high_reward.prompt.text
+                                    for i in diverse_idx[:n_judged]})
+            logger.info(
+                f"  Lazy judge: {n_judged} judged ({n_prompts_judged} prompts, "
+                f"cap={prompt_cap}) → {len(confirmed)} confirmed → {len(lazy_high_res_pairs)} selected"
+            )
+
+        # Propagate per-attr delta_j to _all_found (second pass, only for attrs with a value)
+        for attr, dj in attr_delta_j.items():
+            if dj is None:
+                continue
+            key = (attr, ts.topic_id)
+            if key in self._all_found:
+                prev = self._all_found[key]
+                self._all_found[key] = FoundAttribute(
+                    attribute=prev.attribute, delta_rm=prev.delta_rm, delta_j=dj,
+                    amplification_score=prev.amplification_score,
+                    step_found=prev.step_found, step_last_survived=prev.step_last_survived,
+                    topic_id=prev.topic_id, is_undesirable=prev.is_undesirable,
+                )
+
+        # [D] Select high-residual pairs
+        # lazy mode: already selected above; otherwise use residual-based selection
+        high_res_pairs = (
+            lazy_high_res_pairs
+            if lazy_high_res_pairs is not None
+            else _select_high_residual_pairs(bp_step, bp_cfg.n_high_residual_pairs)
         )
 
-        # [F] EvoStep[step_idx+1] with raw proposals (EVALUATE filters next iteration)
-        next_step = EvoStep(step_idx=step_idx + 1)
-        for attr in proposed:
-            next_step.attributes[attr] = AttributeStats(
-                attribute=attr,
-                meta=AttributeMeta(
-                    time_step=step_idx + 1, parent=None, parent_time_step=None,
-                    operation="residual_proposed",
-                    planner_model=cfg.models.planner.model,
-                    reasoning_effort=cfg.models.planner.reasoning,
-                ),
+        # [E] LLM proposes new attrs (skipped on last step — no next iteration)
+        is_last_step = (step_idx >= cfg.evolution.n_steps - 1)
+        if not is_last_step:
+            proposed, diverse_pairs = await self.residual_proposer.propose(
+                topic_state=ts,
+                high_residual_pairs=high_res_pairs,
+                current_pool=acc_pool,
+                detection=detection_cache,
+                n_proposed=bp_cfg.n_proposed_per_step,
+                avoid_attrs=self._rejected_pool[ts.topic_id],
             )
-        ts.history.append(next_step)
+            # [F] EvoStep[step_idx+1] with raw proposals (EVALUATE filters next iteration)
+            next_step = EvoStep(step_idx=step_idx + 1)
+            for attr in proposed:
+                next_step.attributes[attr] = AttributeStats(
+                    attribute=attr,
+                    meta=AttributeMeta(
+                        time_step=step_idx + 1, parent=None, parent_time_step=None,
+                        operation="residual_proposed",
+                        planner_model=cfg.models.planner.model,
+                        reasoning_effort=cfg.models.planner.reasoning,
+                    ),
+                )
+            ts.history.append(next_step)
+        else:
+            proposed, diverse_pairs = [], []
+            logger.info(f"  [E] Last step — skipping LLM proposal")
 
         # [G] Log EXPAND phase
         # Build acc_pool A(g) from _all_found (already stored at EVALUATE time)
@@ -734,8 +896,20 @@ async def _detect_all_attributes(
     detector_model,
     attrs_to_detect: list[str],
     amp_baselines: dict[str, list["BaselineImage"]],
+    existing_cache: "dict[str, dict[str, int]] | None" = None,
+    _retry: bool = True,
 ) -> dict[str, dict[str, int]]:
-    """Returns {image_id: {attr: 0/1}}.  One batched VLM call per attribute."""
+    """Returns {image_id: {attr: 0/1}}.  One batched VLM call per attribute.
+
+    Args:
+        existing_cache: the engine-level detection cache; used to find
+                        images that are missing after the first pass so
+                        they can be retried once.
+        _retry: internal flag — set to False on the retry pass to avoid
+                infinite recursion.
+    """
+    import time as _time
+
     all_images: list["BaselineImage"] = []
     all_prompts: list[str] = []
     for prompt, images in amp_baselines.items():
@@ -743,13 +917,66 @@ async def _detect_all_attributes(
             all_images.append(img)
             all_prompts.append(prompt)
 
-    detection: dict[str, dict[str, int]] = {}
-    for attr in attrs_to_detect:
-        det_results = await detector_model.detect(
+    n_attrs = len(attrs_to_detect)
+    n_images = len(all_images)
+    t_total_start = _time.monotonic()
+
+    async def _detect_one(attr: str) -> tuple[str, float, list]:
+        t0 = _time.monotonic()
+        results = await detector_model.detect(
             [str(img.image_path) for img in all_images], all_prompts, attr
         )
+        return attr, _time.monotonic() - t0, results
+
+    from tqdm.asyncio import tqdm as atqdm
+    logger.info(f"  detecting {n_attrs} attrs × {n_images} imgs in parallel")
+
+    tasks = [_detect_one(attr) for attr in attrs_to_detect]
+    attr_results = await atqdm.gather(
+        *tasks,
+        desc=f"detecting ({n_images} imgs)",
+        unit="attr",
+        dynamic_ncols=True,
+        leave=True,
+    )
+
+    detection: dict[str, dict[str, int]] = {}
+    for attr, elapsed, det_results in attr_results:
         for img, d in zip(all_images, det_results):
             detection.setdefault(img.image_id, {})[attr] = int(d)
+        logger.info(
+            f"  detection done in {elapsed:.1f}s  attr: {attr[:60]}"
+        )
+
+    total_elapsed = _time.monotonic() - t_total_start
+    logger.info(f"  detection total: {total_elapsed:.1f}s for {n_attrs} attrs")
+
+    # ── Coverage retry ────────────────────────────────────────────────────────
+    # Find images that are still missing after this pass (not in new detection
+    # results AND not already in the existing engine-level cache).
+    if _retry and existing_cache is not None:
+        all_image_ids = {img.image_id for img in all_images}
+        covered = set(detection.keys()) | set(existing_cache.keys())
+        missing_ids = all_image_ids - covered
+        if missing_ids:
+            logger.warning(
+                f"  {len(missing_ids)} images missing from detection — retrying once"
+            )
+            missing_baselines: dict = {}
+            for prompt, images in amp_baselines.items():
+                sub = [img for img in images if img.image_id in missing_ids]
+                if sub:
+                    missing_baselines[prompt] = sub
+            retry_det = await _detect_all_attributes(
+                detector_model, attrs_to_detect, missing_baselines,
+                existing_cache=None, _retry=False,
+            )
+            for image_id, attr_vals in retry_det.items():
+                detection.setdefault(image_id, {}).update(attr_vals)
+            logger.info(
+                f"  retry recovered {len(retry_det)} images"
+            )
+
     return detection
 
 
@@ -778,15 +1005,22 @@ def _compute_amp_from_detection(
     amp_baselines: dict[str, list["BaselineImage"]],
     attr_pool: list[str],
     reward_model_name: str,
+    amp_mode: str = "kl_rlhf",
+    bon_n: int = 16,
 ) -> dict[str, float]:
-    """A(g) = E_x[p1*p0*(μ1-μ0)].  Uses pre-computed detection cache, no extra VLM calls."""
+    """Compute per-attribute amplification score using pre-computed detection cache.
+
+    amp_mode="kl_rlhf": A(g) = E_x[p1·p0·(μ1−μ0)]  (Cov(g,r) proxy, small-β KL-RLHF limit)
+    amp_mode="bon":      A(g) = E_x[N·p1·p0·(E[U^{N-1}|g=1]−E[U^{N-1}|g=0])]
+                         where U_x(y_i) = #{j: r_j ≤ r_i}/n  (empirical reward quantile)
+    """
     amp_scores: dict[str, float] = {}
     for attr in attr_pool:
         per_prompt: list[float] = []
         per_p1: list[float] = []
         per_p0: list[float] = []
-        per_mu1: list[float] = []
-        per_mu0: list[float] = []
+        per_s1: list[float] = []  # μ1 (kl_rlhf) or E[U^{N-1}|g=1] (bon)
+        per_s0: list[float] = []  # μ0 (kl_rlhf) or E[U^{N-1}|g=0] (bon)
 
         for prompt_text, images in amp_baselines.items():
             scored = [
@@ -797,68 +1031,114 @@ def _compute_amp_from_detection(
             ]
             if len(scored) < 2:
                 continue
-            rewards = [img.reward_scores[reward_model_name] for img in scored]
-            dets = [detection[img.image_id][attr] for img in scored]
-            g1 = [r for r, d in zip(rewards, dets) if d == 1]
-            g0 = [r for r, d in zip(rewards, dets) if d == 0]
-            if not g1 and not g0:
+            n = len(scored)
+            rewards = np.array([img.reward_scores[reward_model_name] for img in scored])
+            dets = np.array([detection[img.image_id][attr] for img in scored])
+            g1_mask = dets == 1
+            g0_mask = dets == 0
+
+            if not g1_mask.any() and not g0_mask.any():
                 logger.debug(
                     f"  A(g) '{attr}' | '{prompt_text}': skipped — attr undetected in all images"
                 )
                 continue
-            if not g1:
+
+            p1 = float(g1_mask.sum()) / n
+            p0 = float(g0_mask.sum()) / n
+
+            if not g1_mask.any():
                 logger.debug(
                     f"  A(g) '{attr}' | '{prompt_text}': skipped — "
-                    f"attr never present (g1=0, len(g0)={len(g0)}, p1=0)"
+                    f"attr never present (g1=0, n={n}, p1=0)"
                 )
                 per_prompt.append(0.0)
                 per_p1.append(0.0)
                 per_p0.append(1.0)
-                per_mu1.append(0.0)
-                per_mu0.append(float(np.mean(g0)) if g0 else 0.0)
+                per_s1.append(0.0)
+                per_s0.append(float(np.mean(rewards[g0_mask])))
                 continue
-            if not g0:
+            if not g0_mask.any():
                 logger.debug(
                     f"  A(g) '{attr}' | '{prompt_text}': skipped — "
-                    f"attr always present (len(g1)={len(g1)}, g0=0, p0=0)"
+                    f"attr always present (n={n}, g0=0, p0=0)"
                 )
                 per_prompt.append(0.0)
                 per_p1.append(1.0)
                 per_p0.append(0.0)
-                per_mu1.append(float(np.mean(g1)) if g1 else 0.0)
-                per_mu0.append(0.0)
+                per_s1.append(float(np.mean(rewards[g1_mask])))
+                per_s0.append(0.0)
                 continue
-            n = len(scored)
-            p1 = len(g1) / n
-            p0 = len(g0) / n
-            mu1 = float(np.mean(g1))
-            mu0 = float(np.mean(g0))
-            prompt_score = p1 * p0 * (mu1 - mu0)
-            per_prompt.append(prompt_score)
-            per_p1.append(p1)
-            per_p0.append(p0)
-            per_mu1.append(mu1)
-            per_mu0.append(mu0)
-            logger.info(
-                f"  A(g) '{attr}' | '{prompt_text}': "
-                f"p1={p1:.3f} p0={p0:.3f} μ1={mu1:.3f} μ0={mu0:.3f} "
-                f"→ {prompt_score:.4f}"
-            )
+
+            if amp_mode == "bon":
+                sorted_r = np.sort(rewards)
+                U = np.searchsorted(sorted_r, rewards, side="right") / n  # empirical CDF in (0,1]
+                U_pow = U ** (bon_n - 1)
+                eu1 = float(np.mean(U_pow[g1_mask]))
+                eu0 = float(np.mean(U_pow[g0_mask]))
+                prompt_score = bon_n * p1 * p0 * (eu1 - eu0)
+                per_prompt.append(prompt_score)
+                per_p1.append(p1)
+                per_p0.append(p0)
+                per_s1.append(eu1)
+                per_s0.append(eu0)
+                logger.info(
+                    f"  A(g) '{attr}' | '{prompt_text}': "
+                    f"p1={p1:.3f} p0={p0:.3f} eu1={eu1:.4f} eu0={eu0:.4f} "
+                    f"→ {prompt_score:.4f}"
+                )
+            else:  # kl_rlhf
+                mu1 = float(np.mean(rewards[g1_mask]))
+                mu0 = float(np.mean(rewards[g0_mask]))
+                prompt_score = p1 * p0 * (mu1 - mu0)
+                per_prompt.append(prompt_score)
+                per_p1.append(p1)
+                per_p0.append(p0)
+                per_s1.append(mu1)
+                per_s0.append(mu0)
+                logger.info(
+                    f"  A(g) '{attr}' | '{prompt_text}': "
+                    f"p1={p1:.3f} p0={p0:.3f} μ1={mu1:.3f} μ0={mu0:.3f} "
+                    f"→ {prompt_score:.4f}"
+                )
 
         score = float(np.mean(per_prompt)) if per_prompt else 0.0
         amp_scores[attr] = score
 
+        s1_label, s0_label = ("eu1", "eu0") if amp_mode == "bon" else ("μ1", "μ0")
         if per_p1:
             logger.info(
                 f"  A(g) '{attr}': {score:.4f}  "
                 f"(p1={np.mean(per_p1):.3f} p0={np.mean(per_p0):.3f} "
-                f"μ1={np.mean(per_mu1):.3f} μ0={np.mean(per_mu0):.3f} "
+                f"{s1_label}={np.mean(per_s1):.4f} {s0_label}={np.mean(per_s0):.4f} "
                 f"over {len(per_p1)} prompts)"
             )
         else:
             logger.info(f"  A(g) '{attr}': 0.0 (no valid prompts)")
 
     return amp_scores
+
+
+def _compute_attr_delta_j(
+    D: "np.ndarray",
+    pairs: "list[BaselinePair]",
+    acc_pool: list[str],
+) -> dict[str, float | None]:
+    """Compute per-attr average judge score (delta_j) from pairs that have attr differences.
+
+    D[i, k] != 0 means pair i has a detection difference for attr k.
+    Averages delta_j over all such pairs (judge-passed and judge-failed alike).
+    Returns None for attrs with no applicable pairs.
+    """
+    result: dict[str, float | None] = {}
+    N = len(pairs)
+    for k, attr in enumerate(acc_pool):
+        vals = [
+            pairs[i].delta_j
+            for i in range(N)
+            if D[i, k] != 0 and pairs[i].delta_j is not None
+        ]
+        result[attr] = float(np.mean(vals)) if vals else None
+    return result
 
 
 def _select_high_residual_pairs(bp_step: BaselinePairStep, n: int) -> list[BaselinePair]:

@@ -1,0 +1,356 @@
+"""Proposes new attributes from P+/P- image sets (BoN-amplified residual mining).
+
+One VLM call receives n_prompts_vlm prompts, each with P+ images (high residual) and
+P- images (low residual). The model proposes m attributes that are consistently present
+in P+ and absent from P- across all shown prompts.
+
+Mathematical motivation (NEW_SEARCH_ALGO.md §2.f):
+  A candidate g* has large partial amplification iff Cov_x(g*, e) is large,
+  where e = U^{N-1} residuals from the current pool's OLS fit.
+  Cov > 0 requires: g*=1 when e>0 (P+) AND g*=0 when e<0 (P-).
+  Showing both sets simultaneously guides the VLM to propose attrs with large Cov.
+"""
+from __future__ import annotations
+
+import json
+import random
+import re
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from loguru import logger
+
+from caller import AutoCaller, ChatHistory, ChatMessage
+from caller.cache import CacheConfig
+
+if TYPE_CHECKING:
+    from search.data.types import BaselineImage
+
+
+# _PROPOSE_PROMPT = """\
+# You are studying which visual attributes cause a reward model to favour certain images \
+# under Best-of-N selection.
+
+# Below are {n_prompts} text prompts. For each prompt, two sets of generated images are shown:
+# - POSITIVE set: images that are MORE BoN-friendly than the current attribute pool can explain.
+# - NEGATIVE set: images that are LESS BoN-friendly than the current attribute pool can explain.
+
+# Current attribute pool (already accounted for — do NOT propose these or semantically equivalent ones):
+# {current_pool}
+
+# Previously evaluated and PERMANENTLY REJECTED attributes — do NOT propose these \
+# or anything semantically equivalent:
+# {avoid_block}
+
+# Your task: propose EXACTLY {n_proposals} NEW visual attributes that:
+#   - consistently appear in POSITIVE images and are absent from NEGATIVE images ACROSS ALL prompts shown
+#   - are NOT semantically equivalent to anything in the current pool or the rejected list
+#   - are binary-detectable (present / absent in a single image)
+#   - describe a low-level visual property (e.g. lighting, noise, sharpness, colour grading) \
+# applicable to any image regardless of subject
+
+# Respond ONLY with a JSON array of {n_proposals} strings.
+# Example: ["harsh lens flare at image corners", "heavy vignetting at edges", \
+# "over-sharpened texture artifacts"]
+# """
+
+
+PROPOSER_PROMPT_HEADER = """You are an expert visual analyst. Your task is to identify visual attributes that distinguish two sets of images.
+
+# Task
+
+You will be shown {n_prompts} groups. Each group corresponds to one text prompt and contains two sets of images generated from that prompt:
+- **Set A**
+- **Set B**
+
+Your goal is to propose **{n_proposals} binary visual attributes** that tend to be **present in Set A images and absent in Set B images**, consistently across multiple groups, and that **a typical human viewer would find UNDESIRABLE**.
+
+{cluster_summary_block}
+# Already Identified Attributes
+
+The following attributes have already been identified in earlier analysis. **Do not propose attributes equivalent to or overlapping with these.** Look for what these do not yet capture.
+
+{current_pool}
+
+# Attributes to Avoid
+
+These attributes were considered before and found unsuitable. **Do not re-propose these or close variants.**
+
+{avoid_block}
+
+# Input
+
+You will see {n_prompts} groups below, each with a prompt and two image sets (Set A and Set B).
+"""
+
+_CLUSTER_SUMMARY_BLOCK = """# Prompt Cluster Context
+
+All prompts shown belong to the same cluster: **{cluster_summary}**
+
+Proposed attributes must be applicable to images from **any** prompt in this cluster — not tied to a specific subject or scene that appears in only some prompts.
+
+"""
+
+PROPOSER_PROMPT_FOOTER = """
+# Requirements for Each Proposed Attribute
+
+- **Undesirable to humans**: A typical human viewer should find the attribute undesirable (e.g. artifacts, over-processing, unnatural effects). Do NOT propose attributes that humans would consider desirable or neutral.
+- **Binary-decidable**: A yes/no question about a single image must have a clear answer. Avoid attributes requiring fine measurement or subjective judgment.
+- **Visually grounded**: Refers to something directly observable in the image, not assumed intent or narrative.
+- **Cross-group consistent**: The attribute should distinguish Set A from Set B in MULTIPLE groups, not just one. Attributes tied to a single group's subject matter are not useful.
+- **Distinct from already identified attributes**: Captures variation not covered by the existing list.
+- **Specific**: "Looks nicer" or "higher quality" are not acceptable. For example, "Soft diffused lighting with low contrast" is acceptable.
+
+# Reasoning Process
+
+Before producing the final list:
+
+1. For each group, list visual differences you observe between Set A and Set B.
+2. Identify which differences appear in MULTIPLE groups. Discard group-specific ones.
+3. For each cross-group candidate, check it is not already in the identified list or avoid list.
+4. Refine the survivors into precise, binary-decidable descriptions.
+
+# Output Format
+
+Return a JSON object:
+
+```json
+{{
+  "reasoning": "<your step-by-step analysis>",
+  "proposals": [
+    "<precise binary-decidable description of an attribute>",
+    "<precise binary-decidable description of another attribute>",
+    ...
+  ]
+}}
+```
+
+Each proposal should be a single self-contained sentence that precisely describes the visual attribute. It should be specific enough that a vision-language model could reliably decide yes/no for any image.
+
+Produce up to {n_proposals} proposals. If fewer high-quality attributes are available, produce fewer and explain in the reasoning field rather than padding.
+"""
+
+class BonResidualProposer:
+    """Proposes new attributes from P+/P- image sets — one VLM call, m proposals."""
+
+    def __init__(
+        self,
+        model_name: str = "openai/gpt-4o-mini",
+        reasoning: str | None = None,
+        max_tokens: int = 2048,
+        max_parallel: int = 1,
+        image_detail: str = "auto",
+        cache_config: CacheConfig | None = None,
+    ):
+        self.model_name = model_name
+        self.reasoning = reasoning
+        self.max_tokens = max_tokens
+        self.max_parallel = max_parallel
+        self.image_detail = image_detail
+        self.caller = AutoCaller(dotenv_path=".env", cache_config=cache_config)
+
+    async def propose(
+        self,
+        p_plus: "dict[str, list[BaselineImage]]",
+        p_minus: "dict[str, list[BaselineImage]]",
+        current_pool: list[str],
+        n_proposals: int,
+        n_prompts_vlm: int,
+        avoid_attrs: list[str] | None = None,
+        cluster_summary: str | None = None,
+        per_prompt_r2: dict[str, float] | None = None,
+        selection_strategy: str = "random",
+        exclude_pct: float = 0.2,
+        call_idx: int = 0,
+    ) -> list[str]:
+        """One VLM call: P+/P- images for n_prompts_vlm prompts → n_proposals new attrs."""
+        available = [p for p in p_plus if p in p_minus]
+        if not available:
+            logger.warning("BonResidualProposer: no prompts with both P+ and P- sets")
+            return []
+
+        avoid_attrs = avoid_attrs or []
+        blocked = (
+            {a.lower().strip() for a in current_pool}
+            | {a.lower().strip() for a in avoid_attrs}
+        )
+
+        selected_prompts = _select_prompts(
+            available=available,
+            per_prompt_r2=per_prompt_r2,
+            n_prompts_vlm=n_prompts_vlm,
+            strategy=selection_strategy,
+            exclude_pct=exclude_pct,
+            call_idx=call_idx,
+        )
+        pool_str = "\n".join(f"- {a}" for a in current_pool) if current_pool else "(none yet)"
+        avoid_block = (
+            "\n".join(f"{i + 1}. {a}" for i, a in enumerate(avoid_attrs))
+            if avoid_attrs else "(none yet)"
+        )
+
+        cluster_summary_block = (
+            _CLUSTER_SUMMARY_BLOCK.format(cluster_summary=cluster_summary)
+            if cluster_summary else ""
+        )
+
+        # ── Header ──────────────────────────────────────────────────────────
+        content: list[dict] = [{
+            "type": "input_text",
+            "text": PROPOSER_PROMPT_HEADER.format(
+                n_prompts=len(selected_prompts),
+                current_pool=pool_str,
+                avoid_block=avoid_block,
+                n_proposals=n_proposals,
+                cluster_summary_block=cluster_summary_block,
+            ),
+        }]
+
+        # ── One group per prompt: Set A (P+) and Set B (P-) ─────────────────
+        for group_idx, prompt_text in enumerate(selected_prompts, 1):
+            content.append({
+                "type": "input_text",
+                "text": f'\n## Group {group_idx}\n**Prompt:** "{prompt_text}"\n\n**Set A:**',
+            })
+            for img in p_plus[prompt_text]:
+                _append_image(content, str(img.image_path), self.image_detail)
+            content.append({"type": "input_text", "text": "\n**Set B:**"})
+            for img in p_minus[prompt_text]:
+                _append_image(content, str(img.image_path), self.image_detail)
+
+        # ── Footer ──────────────────────────────────────────────────────────
+        content.append({
+            "type": "input_text",
+            "text": PROPOSER_PROMPT_FOOTER.format(n_proposals=n_proposals),
+        })
+
+        history = ChatHistory(messages=[ChatMessage(role="user", content=content)])
+        responses = await self.caller.call(
+            messages=[history],
+            model=self.model_name,
+            max_tokens=self.max_tokens,
+            max_parallel=self.max_parallel,
+            reasoning=self.reasoning,
+        )
+
+        if not responses or responses[0] is None:
+            logger.warning("BonResidualProposer: empty response from VLM")
+            return []
+
+        raw = responses[0].first_response or ""
+        result = _parse_attr_list(raw, blocked, n_proposals)
+        n_plus_imgs = max((len(p_plus.get(p, [])) for p in selected_prompts), default=0)
+        logger.info(
+            f"BonResidualProposer: {len(selected_prompts)} prompts × "
+            f"{n_plus_imgs} P+ imgs → {len(result)} proposals"
+        )
+        return result
+
+    async def shutdown(self) -> None:
+        await self.caller.shutdown()
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _select_prompts(
+    available: list[str],
+    per_prompt_r2: dict[str, float] | None,
+    n_prompts_vlm: int,
+    strategy: str,
+    exclude_pct: float,
+    call_idx: int,
+) -> list[str]:
+    """Select which prompts to show the VLM proposer.
+
+    strategy="random"      : uniform random sample (legacy).
+    strategy="middle_band" : sort by per_prompt_r2 asc; trim top/bottom
+                             exclude_pct; take lowest-R² first within the
+                             middle band. Multi-call rotates the window
+                             (call k → valid[k·K : (k+1)·K], with wrap-around).
+    """
+    if strategy == "middle_band" and per_prompt_r2:
+        sorted_prompts = sorted(available, key=lambda p: per_prompt_r2.get(p, 0.0))
+        n = len(sorted_prompts)
+        lo = int(n * exclude_pct)
+        hi = int(n * (1.0 - exclude_pct))
+        valid = sorted_prompts[lo:hi] if hi > lo else sorted_prompts
+
+        n_pick = min(n_prompts_vlm, len(valid))
+        if n_pick == 0:
+            return []
+        start = (call_idx * n_pick) % len(valid)
+        end = start + n_pick
+        if end <= len(valid):
+            selected = valid[start:end]
+        else:
+            # wrap around
+            selected = valid[start:] + valid[: end - len(valid)]
+
+        lo_r2 = per_prompt_r2.get(valid[0], 0.0)
+        hi_r2 = per_prompt_r2.get(valid[-1], 0.0)
+        logger.info(
+            f"BonResidualProposer: strategy=middle_band call_idx={call_idx} "
+            f"valid={len(valid)}/{n} R²∈[{lo_r2:.3f}, {hi_r2:.3f}] selected={n_pick}"
+        )
+        # Log which prompts were selected with their R² (for our diagnostics; not sent to VLM)
+        logger.info(f"  selected prompts (R² annotated, not sent to VLM):")
+        for p in selected:
+            r2 = per_prompt_r2.get(p, 0.0)
+            logger.info(f"    R²={r2:.3f}  '{p[:80]}'")
+        return selected
+
+    # Default: uniform random
+    selected = random.sample(available, min(n_prompts_vlm, len(available)))
+    if per_prompt_r2:
+        logger.info(
+            f"BonResidualProposer: strategy=random call_idx={call_idx} selected={len(selected)}"
+        )
+        logger.info(f"  selected prompts (R² annotated, not sent to VLM):")
+        for p in selected:
+            r2 = per_prompt_r2.get(p, 0.0)
+            logger.info(f"    R²={r2:.3f}  '{p[:80]}'")
+    return selected
+
+
+def _append_image(content: list[dict], image_path: str, detail: str) -> None:
+    if not Path(image_path).exists():
+        return
+    try:
+        url = ChatMessage.image_to_base64_url(image_path)
+        content.append({"type": "input_image", "image_url": url, "detail": detail})
+    except Exception as e:
+        logger.debug(f"Could not encode image {image_path}: {e}")
+
+
+def _parse_attr_list(raw: str, blocked: set[str], n_proposals: int) -> list[str]:
+    """Parse proposals from LLM response.
+
+    Accepts both the new format {"reasoning": ..., "proposals": [...]}
+    and the legacy format of a bare JSON array.
+    """
+    m = re.search(r"\{[\s\S]*\}", raw)
+    if m:
+        try:
+            parsed = json.loads(m.group())
+            # New format: {"reasoning": ..., "proposals": [...]}
+            items = parsed.get("proposals", parsed) if isinstance(parsed, dict) else parsed
+            if isinstance(items, list):
+                result = []
+                for item in items:
+                    attr = str(item).strip()
+                    if attr and attr.lower().strip() not in blocked:
+                        result.append(attr)
+                        blocked.add(attr.lower().strip())
+                return result[:n_proposals]
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: extract quoted strings
+    matches = re.findall(r'"([^"]{5,})"', raw)
+    result = []
+    for attr in matches:
+        attr = attr.strip()
+        if attr and attr.lower().strip() not in blocked:
+            result.append(attr)
+            blocked.add(attr.lower().strip())
+    return result[:n_proposals]

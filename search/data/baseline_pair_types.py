@@ -44,3 +44,7 @@ class BaselinePairStep:
     reg_alpha: float = 0.0                 # regularization alpha chosen by CV (set by EXPAND)
     reg_l1_ratio: float = 1.0             # L1/(L1+L2) ratio chosen by CV (set by EXPAND)
     residuals: np.ndarray | None = None     # ℝ^N (set by EXPAND)
+    reg_var_explained: float | None = None  # R² on full N pairs from regression (set by EXPAND)
+    reg_n_pairs: int | None = None           # N used in regression (before judge filter) (set by EXPAND)
+    reg_residual_mean_abs: float | None = None  # mean|residual| on full N pairs (set by EXPAND)
+    reg_residual_max_abs: float | None = None   # max|residual| on full N pairs (set by EXPAND)

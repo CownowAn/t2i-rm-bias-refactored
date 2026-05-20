@@ -6,9 +6,11 @@ from typing import TYPE_CHECKING
 
 from search.utils.cost import (
     _call_cost,
-    _image_tokens,
+    _img_tok,
     _JUDGE_DETECT_TEXT_TOK,
     _JUDGE_DETECT_OUT_TOK,
+    _BASELINE_IMG_W,
+    _BASELINE_IMG_H,
 )
 
 if TYPE_CHECKING:
@@ -25,13 +27,21 @@ def estimate_bon_cost(config: "BonConfig") -> tuple[dict[str, float], dict]:
     The only API expense is VLM detection — one call per (image, attribute).
     Reward scoring (ImageReward) runs locally on GPU at zero API cost.
     """
-    img_tok = _image_tokens()
     detector_model = config.models.detector.model
-    detect_per_call = _call_cost(
-        detector_model,
-        _JUDGE_DETECT_TEXT_TOK + img_tok,
-        _JUDGE_DETECT_OUT_TOK,
-    )
+    detector_is_local = bool(config.models.detector.vllm_base_url)
+    if detector_is_local:
+        detect_per_call = 0.0
+    else:
+        img_tok = _img_tok(
+            detector_model, _BASELINE_IMG_W, _BASELINE_IMG_H,
+            detail=config.models.detector.image_detail,
+        )
+        batch_discount = 0.5 if config.models.detector.use_batch_api else 1.0
+        detect_per_call = _call_cost(
+            detector_model,
+            _JUDGE_DETECT_TEXT_TOK + img_tok,
+            _JUDGE_DETECT_OUT_TOK,
+        ) * batch_discount
 
     n_attrs, attrs_source = _count_attributes(config)
     n_images_per_prompt, manifest_source = _sample_images_per_prompt(config.data.baseline_manifest)
@@ -43,6 +53,10 @@ def estimate_bon_cost(config: "BonConfig") -> tuple[dict[str, float], dict]:
 
     meta = {
         "detector_model": detector_model,
+        "detector_is_local": detector_is_local,
+        "vllm_base_url": config.models.detector.vllm_base_url,
+        "image_detail": config.models.detector.image_detail,
+        "use_batch_api": config.models.detector.use_batch_api,
         "n_topics": n_topics,
         "n_val_prompts": n_val_prompts,
         "n_images_per_prompt": n_images_per_prompt,
@@ -65,15 +79,22 @@ def log_bon_cost_estimate(config: "BonConfig") -> None:
 
     breakdown, meta = estimate_bon_cost(config)
     n_calls = meta["n_total_detection_calls"]
+    if meta["detector_is_local"]:
+        serving_tag = f"  [local vLLM: {meta['vllm_base_url']}]"
+    elif meta["use_batch_api"]:
+        serving_tag = "  [batch API 50% discount]"
+    else:
+        serving_tag = ""
     lines = [
         "── Estimated API Cost (BoN) ─────────────────────────────────",
-        f"  Detector model:          {meta['detector_model']}",
+        f"  Detector model:          {meta['detector_model']}{serving_tag}",
+        f"  Image detail:            {meta['image_detail']}",
         f"  Topics:                  {meta['n_topics']}",
         f"  Val prompts per topic:   {meta['n_val_prompts']}",
         f"  Images per prompt:       ~{meta['n_images_per_prompt']}  ({meta['manifest_source']})",
         f"  Attributes tracked:      {meta['n_attrs']}  ({meta['attrs_source']})",
         f"  Total detection calls:   {n_calls:,}  "
-        f"(@ ${meta['detect_per_call_usd'] * 1000:.4f} per 1k calls)",
+        + (f"(local vLLM — $0)" if meta["detector_is_local"] else f"(@ ${meta['detect_per_call_usd'] * 1000:.4f} per 1k calls)"),
         "  ─────────────────────────────────────────────────────────────",
         f"  Detection  (cold cache):    ${breakdown['detection']:>8.2f}",
         f"  Detection  (hot cache):     ${0.0:>8.2f}",

@@ -1,6 +1,7 @@
 import argparse
 import json
 import re
+import textwrap
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -61,7 +62,8 @@ def plot_one_attribute(json_path: Path, data: dict, attr: str, attr_idx: int):
         bbox=dict(boxstyle="round,pad=0.4", alpha=0.2),
     )
 
-    ax.set_title(attr, pad=16)
+    wrapped_title = "\n".join(textwrap.wrap(attr, width=50)) or attr
+    ax.set_title(wrapped_title, pad=12, fontsize=14)
     ax.set_xlabel("n_values")
     ax.set_ylabel("Prevalence")
 
@@ -75,17 +77,98 @@ def plot_one_attribute(json_path: Path, data: dict, attr: str, attr_idx: int):
     y_margin = max(0.01, (y_max - y_min) * 0.25)
     ax.set_ylim(y_min - y_margin, y_max + y_margin)
 
-    fig.tight_layout()
+    # Use a fixed layout area so figure size stays constant across titles.
+    # `top` leaves room for up to ~3 wrapped title lines.
+    fig.subplots_adjust(left=0.1, right=0.97, top=0.78, bottom=0.12)
 
     # Save one plot per attribute in the same directory as the input JSON file
     attr_slug = slugify(attr)
     output_path = json_path.with_name(
         f"{json_path.stem}_attr{attr_idx:02d}_{attr_slug}_prevalence_by_n.png"
     )
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    fig.savefig(output_path, dpi=200)
     plt.close(fig)
 
     return output_path
+
+
+def plot_summary(json_path: Path, data: dict, mode: str = "subtracted"):
+    """Mean prevalence curve across all attributes (with ±1 std band).
+
+    mode="subtracted": y = mean over attrs of (prev[n] - prev[n=1]).
+                       Each attr starts at 0; isolates BoN-induced amplification.
+                       Saved as {stem}_summary.png
+    mode="raw":        y = mean over attrs of prev[n]. Absolute prevalence
+                       averaged across attrs. Saved as {stem}_summary_raw.png
+    """
+    import numpy as np
+
+    n_values = data["n_values"]
+    prevalence = data["prevalence"]
+    attrs = [a for a in data["attributes"] if a in prevalence]
+    if not attrs:
+        print(f"plot_summary[{mode}]: no attributes with prevalence — skipping")
+        return None
+
+    if mode == "subtracted":
+        if 1 not in n_values:
+            print("plot_summary[subtracted]: n=1 not in subset — skipping")
+            return None
+        base_idx = n_values.index(1)
+        mat = np.array([
+            [prevalence[a][i] - prevalence[a][base_idx] for i in range(len(n_values))]
+            for a in attrs
+        ], dtype=float)
+        ylabel   = "mean Δ prevalence  (prev[n] − prev[n=1])"
+        title    = (f"Summary across {len(attrs)} attributes\n"
+                    f"(baseline-subtracted mean, ±1 std band)")
+        ref_line = 0.0
+        suffix   = "_summary"
+        show_band = True
+    elif mode == "raw":
+        mat = np.array([prevalence[a] for a in attrs], dtype=float)
+        ylabel   = "mean prevalence  P(attr=1 | BoN-n)"
+        title    = (f"Summary across {len(attrs)} attributes\n"
+                    f"(raw mean prevalence)")
+        ref_line = None
+        suffix   = "_summary_raw"
+        show_band = False
+    else:
+        raise ValueError(f"mode must be 'subtracted' or 'raw', got {mode!r}")
+
+    mean = mat.mean(axis=0)
+    std  = mat.std(axis=0)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    if ref_line is not None:
+        ax.axhline(ref_line, linestyle="--", linewidth=1.2, color="gray", alpha=0.6)
+    if show_band:
+        ax.fill_between(n_values, mean - std, mean + std, alpha=0.25, label="±1 std")
+    ax.plot(n_values, mean, marker="o", linewidth=2.5, label="mean")
+    ax.scatter([n_values[0], n_values[-1]], [mean[0], mean[-1]], s=120, zorder=3)
+    fmt = "{:+.3f}" if mode == "subtracted" else "{:.3f}"
+    ax.text(n_values[0], mean[0],
+            f"  n={n_values[0]}: " + fmt.format(mean[0]),
+            va="bottom", ha="left", fontsize=14)
+    ax.text(n_values[-1], mean[-1],
+            f"  n={n_values[-1]}: " + fmt.format(mean[-1]),
+            va="bottom", ha="right", fontsize=14)
+
+    ax.set_xscale("log", base=2)
+    ax.set_xticks(n_values)
+    ax.set_xticklabels([str(n) for n in n_values])
+    ax.set_xlabel("n_values")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, pad=12, fontsize=14)
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(loc="upper left", fontsize=14)
+    fig.subplots_adjust(left=0.1, right=0.97, top=0.85, bottom=0.12)
+
+    out_path = json_path.with_name(f"{json_path.stem}{suffix}.png")
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    print(f"Saved summary plot [{mode}]: {out_path}")
+    return out_path
 
 
 def plot_prevalence(json_path: str, n_values: list[int] | None = None):
@@ -126,6 +209,11 @@ def plot_prevalence(json_path: str, n_values: list[int] | None = None):
 
         output_path = plot_one_attribute(json_path, data, attr, attr_idx)
         output_paths.append(output_path)
+
+    for mode in ("subtracted", "raw"):
+        summary_path = plot_summary(json_path, data, mode=mode)
+        if summary_path is not None:
+            output_paths.append(summary_path)
 
     print("Saved plots:")
     for path in output_paths:

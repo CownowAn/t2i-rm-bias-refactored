@@ -1,0 +1,16 @@
+# Baseline image generation environment
+# FLUX.1-dev requires diffusers>=0.30 and transformers>=4.42
+
+torch==2.5.1
+torchvision==0.20.1
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+diffusers>=0.32.0
+transformers>=4.45.0
+accelerate>=0.34.0
+sentencepiece
+protobuf
+tqdm
+pillow
+safetensors
+huggingface-hub>=0.24.0
