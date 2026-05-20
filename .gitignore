@@ -13,3 +13,6 @@ search/NEW_SEARCH_ALGO.md
 .vscode/
 amplification.md
 .env
+debug.py
+debug.txt
+debug_matrix.py
