@@ -1,4 +1,4 @@
-"""Entry point: python search/main.py --config search/configs/default.yaml [key=value ...]"""
+"""Entry point: python search/main.py --config search/configs/x.yaml [key=value ...]"""
 from __future__ import annotations
 
 import argparse
@@ -37,8 +37,10 @@ async def main() -> None:
     logger.add(str(log_path), level="DEBUG", rotation="50 MB")
 
     # Save the original config yaml and the effective config (with CLI overrides applied)
-    shutil.copy(args.config, log_path.parent / "config_source.yaml")
-    effective_config_path = log_path.parent / "config_effective.yaml"
+    configs_dir = log_path.parent / "configs"
+    configs_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy(args.config, configs_dir / "config_source.yaml")
+    effective_config_path = configs_dir / "config_effective.yaml"
     with open(effective_config_path, "w") as f:
         yaml.dump(config.to_dict(), f, default_flow_style=False, allow_unicode=True)
 

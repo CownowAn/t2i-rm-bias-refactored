@@ -180,6 +180,7 @@ class BaselinePairEvolutionEngine:
             order=config.evolution.image_order,
             random_seed=config.run.random_seed,
             require_editable=False,  # baseline-pairs: VLM detection, not FLUX editing
+            score_normalization=config.evolution.initial_score_normalization,
             cache_config=cache_config,
         )
         clusterer = AttributeClusterer(
@@ -1046,6 +1047,18 @@ def _compute_amp_from_detection(
             p1 = float(g1_mask.sum()) / n
             p0 = float(g0_mask.sum()) / n
 
+            # Per-prompt statistic vector — units depend on amp_mode:
+            #   bon     → stat = U^{N-1} (empirical BoN quantile power, [0, 1])
+            #   kl_rlhf → stat = raw reward (reward-model native scale)
+            # Used uniformly in edge-case paths and the normal path so the
+            # per_s0/per_s1 diagnostics never mix units.
+            if amp_mode == "bon":
+                sorted_r = np.sort(rewards)
+                U = np.searchsorted(sorted_r, rewards, side="right") / n  # empirical CDF in (0,1]
+                stat_vec = U ** (bon_n - 1)
+            else:
+                stat_vec = rewards
+
             if not g1_mask.any():
                 logger.debug(
                     f"  A(g) '{attr}' | '{prompt_text}': skipped — "
@@ -1055,7 +1068,7 @@ def _compute_amp_from_detection(
                 per_p1.append(0.0)
                 per_p0.append(1.0)
                 per_s1.append(0.0)
-                per_s0.append(float(np.mean(rewards[g0_mask])))
+                per_s0.append(float(np.mean(stat_vec[g0_mask])))
                 continue
             if not g0_mask.any():
                 logger.debug(
@@ -1065,41 +1078,28 @@ def _compute_amp_from_detection(
                 per_prompt.append(0.0)
                 per_p1.append(1.0)
                 per_p0.append(0.0)
-                per_s1.append(float(np.mean(rewards[g1_mask])))
+                per_s1.append(float(np.mean(stat_vec[g1_mask])))
                 per_s0.append(0.0)
                 continue
 
             if amp_mode == "bon":
-                sorted_r = np.sort(rewards)
-                U = np.searchsorted(sorted_r, rewards, side="right") / n  # empirical CDF in (0,1]
-                U_pow = U ** (bon_n - 1)
-                eu1 = float(np.mean(U_pow[g1_mask]))
-                eu0 = float(np.mean(U_pow[g0_mask]))
+                eu1 = float(np.mean(stat_vec[g1_mask]))
+                eu0 = float(np.mean(stat_vec[g0_mask]))
                 prompt_score = bon_n * p1 * p0 * (eu1 - eu0)
                 per_prompt.append(prompt_score)
                 per_p1.append(p1)
                 per_p0.append(p0)
                 per_s1.append(eu1)
                 per_s0.append(eu0)
-                logger.info(
-                    f"  A(g) '{attr}' | '{prompt_text}': "
-                    f"p1={p1:.3f} p0={p0:.3f} eu1={eu1:.4f} eu0={eu0:.4f} "
-                    f"→ {prompt_score:.4f}"
-                )
             else:  # kl_rlhf
-                mu1 = float(np.mean(rewards[g1_mask]))
-                mu0 = float(np.mean(rewards[g0_mask]))
+                mu1 = float(np.mean(stat_vec[g1_mask]))
+                mu0 = float(np.mean(stat_vec[g0_mask]))
                 prompt_score = p1 * p0 * (mu1 - mu0)
                 per_prompt.append(prompt_score)
                 per_p1.append(p1)
                 per_p0.append(p0)
                 per_s1.append(mu1)
                 per_s0.append(mu0)
-                logger.info(
-                    f"  A(g) '{attr}' | '{prompt_text}': "
-                    f"p1={p1:.3f} p0={p0:.3f} μ1={mu1:.3f} μ0={mu0:.3f} "
-                    f"→ {prompt_score:.4f}"
-                )
 
         score = float(np.mean(per_prompt)) if per_prompt else 0.0
         amp_scores[attr] = score

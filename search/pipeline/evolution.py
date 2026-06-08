@@ -124,6 +124,7 @@ class EvolutionEngine:
             direction=config.evolution.direction,
             order=config.evolution.image_order,
             random_seed=config.run.random_seed,
+            score_normalization=config.evolution.initial_score_normalization,
         )
 
         mutator = AttributeMutator(

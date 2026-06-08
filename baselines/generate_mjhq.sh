@@ -20,15 +20,19 @@ mkdir -p "$TMPDIR"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 GPUS=""
-TOPIC_IDS="0 1 2 3 4 5 6 7 8 9"
+# TOPIC_IDS="0 1 2 3 4 5 6 7 8 9"
+TOPIC_IDS="0 3 5 6 8 9 1 2 4 7"
 MODEL_ID="black-forest-labs/FLUX.1-dev"
-CLUSTER_DIR="clustering/output/mjhq"
-OUTPUT_DIR="/nfs/data/sohyun/projects/t2i-rm-bias/data/baselines/mjhq"
+MODEL_ID="stabilityai/stable-diffusion-3.5-medium"
+# CLUSTER_DIR="clustering/output/mjhq"
+CLUSTER_DIR="clustering/output/mjhq_10tok/100prompt"
+OUTPUT_DIR="/nfs/data/sohyun/projects/t2i-rm-bias/data/baselines/mjhq_10tok/100prompt"
 HF_CACHE_DIR="/nfs/data/sohyun/models"
 IMAGES_PER_PROMPT=128
 IMAGE_WIDTH=512
 IMAGE_HEIGHT=512
 PYTHON="python"   # override with --python /path/to/venv/bin/python if needed
+KEEP_ALIVE=0      # set to 1 with --keep_alive: hold pipelines on GPU after merge
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -47,6 +51,7 @@ while [[ $# -gt 0 ]]; do
         --output_dir)        OUTPUT_DIR="$2";         shift 2 ;;
         --images_per_prompt) IMAGES_PER_PROMPT="$2";  shift 2 ;;
         --python)            PYTHON="$2";             shift 2 ;;
+        --keep_alive)        KEEP_ALIVE=1;            shift   ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -54,6 +59,12 @@ done
 if [[ -z "$GPUS" ]]; then
     echo "ERROR: --gpus is required (e.g. --gpus 0,1,2,3)"
     exit 1
+fi
+
+# SD 2.1 (768 v-pred) — auto-bump resolution; -base variants stay at 512.
+if [[ "$MODEL_ID" == *stable-diffusion-2* && "$MODEL_ID" != *-base ]]; then
+    IMAGE_WIDTH=768
+    IMAGE_HEIGHT=768
 fi
 
 IFS=',' read -ra GPU_LIST <<< "$GPUS"
@@ -67,9 +78,22 @@ echo "=== MJHQ Baseline Generation ==="
 echo "  GPUs:    ${GPU_LIST[*]} (${N_GPUS} total)"
 echo "  Topics:  ${ALL_TOPICS[*]}"
 echo "  Model:   $MODEL_ID"
+echo "  Res:     ${IMAGE_WIDTH}x${IMAGE_HEIGHT}"
 echo "  Output:  $OUTPUT_DIR"
 echo "  Mode:    one python per GPU; each handles all topics; FLUX loaded once"
+[[ $KEEP_ALIVE -eq 1 ]] && echo "  Keep:    pipelines stay on GPU after merge (Ctrl+C to release)"
 echo ""
+
+# Done-flag dir for keep-alive mode: pythons touch a file here when their
+# topic loop is finished but BEFORE idling, so the shell can run the manifest
+# merge without having to wait on the (still-running) python process.
+DONE_DIR="$LOG_DIR/.done_flags"
+KEEP_ALIVE_ARGS=()
+if [[ $KEEP_ALIVE -eq 1 ]]; then
+    rm -rf "$DONE_DIR"
+    mkdir -p "$DONE_DIR"
+    KEEP_ALIVE_ARGS=(--keep_alive --done_flag_dir "$DONE_DIR")
+fi
 
 # ── Launch one shard per GPU; each processes ALL topics in sequence ──────────
 PIDS=()
@@ -89,24 +113,57 @@ for rank in "${!GPU_LIST[@]}"; do
         --hf_cache_dir "$HF_CACHE_DIR" \
         --num_shards $N_GPUS \
         --shard_rank $rank \
+        "${KEEP_ALIVE_ARGS[@]}" \
         2>&1 | sed -u "s/^/[GPU $gpu | shard $rank] /" | tee "$log" &
 
     PIDS+=($!)
 done
 
-# Wait for all shards
 FAILED=0
-for i in "${!PIDS[@]}"; do
-    pid="${PIDS[$i]}"; gpu="${GPU_LIST[$i]}"
-    if wait "$pid"; then
-        echo "  GPU $gpu: done"
-    else
-        echo "  GPU $gpu: FAILED (see $LOG_DIR/gpu${gpu}.log)"
-        FAILED=1
-    fi
-done
+if [[ $KEEP_ALIVE -eq 1 ]]; then
+    # Poll for done flags instead of `wait`ing on PIDs (which would block
+    # forever because pythons idle on GPU after generation).
+    echo "Waiting for all $N_GPUS shards to write done flags in $DONE_DIR ..."
+    while true; do
+        n_done=0
+        for rank in "${!GPU_LIST[@]}"; do
+            [[ -e "$DONE_DIR/shard_${rank}.done" ]] && n_done=$((n_done + 1))
+        done
+        if [[ $n_done -eq $N_GPUS ]]; then break; fi
 
-[[ $FAILED -eq 1 ]] && { echo "Aborting due to failure."; exit 1; }
+        # Detect a crashed shard (process gone without writing its flag).
+        for i in "${!PIDS[@]}"; do
+            pid="${PIDS[$i]}"; gpu="${GPU_LIST[$i]}"
+            if ! kill -0 "$pid" 2>/dev/null \
+               && [[ ! -e "$DONE_DIR/shard_${i}.done" ]]; then
+                echo "  GPU $gpu (shard $i): FAILED (see $LOG_DIR/gpu${gpu}.log)"
+                FAILED=1
+            fi
+        done
+        [[ $FAILED -eq 1 ]] && break
+        sleep 5
+    done
+    if [[ $FAILED -ne 1 ]]; then
+        echo "All shards reported done. Proceeding to merge while pipelines stay loaded."
+    fi
+else
+    # Wait for all shards in the usual (non-keep-alive) path.
+    for i in "${!PIDS[@]}"; do
+        pid="${PIDS[$i]}"; gpu="${GPU_LIST[$i]}"
+        if wait "$pid"; then
+            echo "  GPU $gpu: done"
+        else
+            echo "  GPU $gpu: FAILED (see $LOG_DIR/gpu${gpu}.log)"
+            FAILED=1
+        fi
+    done
+fi
+
+if [[ $FAILED -eq 1 ]]; then
+    [[ $KEEP_ALIVE -eq 1 ]] && { echo "Killing surviving shards ..."; kill "${PIDS[@]}" 2>/dev/null; }
+    echo "Aborting due to failure."
+    exit 1
+fi
 
 # ── Merge shard manifests per topic ───────────────────────────────────────────
 for topic_id in "${ALL_TOPICS[@]}"; do
@@ -144,3 +201,12 @@ echo "Then update bon_amplified.yaml:"
 echo "  data.baseline_manifest: $OUTPUT_DIR/topic_0/${MODEL_DIR_NAME}/manifest.json"
 echo "  data.baseline_root: $(pwd)"
 echo "  data.topic_ids: [0]"
+
+if [[ $KEEP_ALIVE -eq 1 ]]; then
+    echo ""
+    echo "── Keep-alive mode ──────────────────────────────────────────────────────"
+    echo "Pipelines remain loaded on GPUs: ${GPU_LIST[*]}"
+    echo "Press Ctrl+C (or kill this shell) to release."
+    trap 'echo ""; echo "Releasing GPUs ..."; kill "${PIDS[@]}" 2>/dev/null; wait 2>/dev/null; exit 0' INT TERM
+    wait
+fi

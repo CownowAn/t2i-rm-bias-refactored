@@ -7,6 +7,10 @@ export TMPDIR=/nfs/data/sohyun/tmp
 export TRITON_CACHE_DIR=/nfs/data/sohyun/triton_cache
 mkdir -p "$TMPDIR" "$TRITON_CACHE_DIR"
 
+# Data-parallel size = number of visible GPUs
+DP=$(echo "$gpu" | tr ',' '\n' | grep -c .)
+echo "Serving $model on GPUs [$gpu] with -dp $DP"
+
 # vllm 0.19.1 on NFS venv
 #   - torch 2.10.0+cu128: CUDA 12.8 native (no libcudart.so.13 hack needed)
 #   - SM86 (A6000) works: no SM86 CUBIN but CUDA driver handles compatibility
@@ -17,7 +21,7 @@ source /nfs/data/sohyun/venvs/vllm-qwen35/bin/activate
 
 VLLM_ATTENTION_BACKEND=XFORMERS vllm serve "$model" \
   --port 8000 \
-  -dp 4 \
+  -dp "$DP" \
   --enforce-eager \
   --mm-encoder-tp-mode data \
   --mm-processor-cache-type shm \

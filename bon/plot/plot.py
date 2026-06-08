@@ -15,7 +15,8 @@ def slugify(text: str, max_len: int = 80) -> str:
     return text[:max_len] or "attribute"
 
 
-def plot_one_attribute(json_path: Path, data: dict, attr: str, attr_idx: int):
+def plot_one_attribute(json_path: Path, data: dict, attr: str, attr_idx: int,
+                       out_stem_suffix: str = ""):
     n_values = data["n_values"]
     prevalence = data["prevalence"][attr]
 
@@ -84,7 +85,7 @@ def plot_one_attribute(json_path: Path, data: dict, attr: str, attr_idx: int):
     # Save one plot per attribute in the same directory as the input JSON file
     attr_slug = slugify(attr)
     output_path = json_path.with_name(
-        f"{json_path.stem}_attr{attr_idx:02d}_{attr_slug}_prevalence_by_n.png"
+        f"{json_path.stem}{out_stem_suffix}_attr{attr_idx:02d}_{attr_slug}_prevalence_by_n.png"
     )
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
@@ -92,7 +93,8 @@ def plot_one_attribute(json_path: Path, data: dict, attr: str, attr_idx: int):
     return output_path
 
 
-def plot_summary(json_path: Path, data: dict, mode: str = "subtracted"):
+def plot_summary(json_path: Path, data: dict, mode: str = "subtracted",
+                 out_stem_suffix: str = ""):
     """Mean prevalence curve across all attributes (with ±1 std band).
 
     mode="subtracted": y = mean over attrs of (prev[n] - prev[n=1]).
@@ -164,18 +166,52 @@ def plot_summary(json_path: Path, data: dict, mode: str = "subtracted"):
     ax.legend(loc="upper left", fontsize=14)
     fig.subplots_adjust(left=0.1, right=0.97, top=0.85, bottom=0.12)
 
-    out_path = json_path.with_name(f"{json_path.stem}{suffix}.png")
+    out_path = json_path.with_name(f"{json_path.stem}{out_stem_suffix}{suffix}.png")
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
     print(f"Saved summary plot [{mode}]: {out_path}")
     return out_path
 
 
-def plot_prevalence(json_path: str, n_values: list[int] | None = None):
+def plot_prevalence(json_path: str, n_values: list[int] | None = None,
+                    posthoc_cleanup_path: str | None = None):
     json_path = Path(json_path)
 
     with open(json_path, "r") as f:
         data = json.load(f)
+
+    out_stem_suffix = ""
+    if posthoc_cleanup_path is not None:
+        with open(posthoc_cleanup_path, "r") as f:
+            cleanup = json.load(f)
+        kept_scores = cleanup.get("kept_loo_scores") or {}
+        kept = set(cleanup.get("kept_pool", []))
+        if not kept:
+            raise ValueError(
+                f"posthoc cleanup file has empty kept_pool: {posthoc_cleanup_path}"
+            )
+        orig_attrs_set = set(data["attributes"])
+        # Sort kept attrs by kept_loo_scores desc; tie-break by attribute text
+        # so the order is deterministic. Attrs without a score (shouldn't happen
+        # for kept ones, but defensive) sort to the end.
+        filtered = sorted(
+            (a for a in kept if a in orig_attrs_set),
+            key=lambda a: (-(kept_scores.get(a, float("-inf"))), a),
+        )
+        missing_in_bon = [a for a in kept if a not in orig_attrs_set]
+        if missing_in_bon:
+            print(
+                f"[WARN] {len(missing_in_bon)} attrs in kept_pool are NOT in bon "
+                f"results — they will be silently ignored. First: "
+                f"{missing_in_bon[0]!r}"
+            )
+        print(
+            f"posthoc cleanup filter: kept {len(filtered)}/{len(data['attributes'])} "
+            f"attrs (cleanup kept_pool size = {len(kept)}); ordered by "
+            f"kept_loo_scores desc"
+        )
+        data["attributes"] = filtered
+        out_stem_suffix = "_postcleanup"
 
     if n_values is not None:
         available = set(data["n_values"])
@@ -207,11 +243,15 @@ def plot_prevalence(json_path: str, n_values: list[int] | None = None):
             print(f"Skipping missing prevalence values for attribute: {attr}")
             continue
 
-        output_path = plot_one_attribute(json_path, data, attr, attr_idx)
+        output_path = plot_one_attribute(
+            json_path, data, attr, attr_idx, out_stem_suffix=out_stem_suffix,
+        )
         output_paths.append(output_path)
 
     for mode in ("subtracted", "raw"):
-        summary_path = plot_summary(json_path, data, mode=mode)
+        summary_path = plot_summary(
+            json_path, data, mode=mode, out_stem_suffix=out_stem_suffix,
+        )
         if summary_path is not None:
             output_paths.append(summary_path)
 
@@ -235,6 +275,19 @@ if __name__ == "__main__":
         default=None,
         help="Subset of n values to plot (e.g. --n_values 1 4 16 64). Defaults to all.",
     )
+    parser.add_argument(
+        "--posthoc_cleanup_path",
+        type=str,
+        default=None,
+        help=("Path to a posthoc_cleanup_topic*_step*.json from a search run. "
+              "When given, only attributes in its `kept_pool` are plotted, and "
+              "output filenames get a `_postcleanup` suffix so they coexist with "
+              "the full-attr plots."),
+    )
     args = parser.parse_args()
 
-    plot_prevalence(args.json_path, n_values=args.n_values)
+    plot_prevalence(
+        args.json_path,
+        n_values=args.n_values,
+        posthoc_cleanup_path=args.posthoc_cleanup_path,
+    )

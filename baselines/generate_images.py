@@ -38,13 +38,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--random_seed", type=int, default=42)
     p.add_argument("--hf_cache_dir", default="/nfs/data/sohyun/models",
                    help="HuggingFace model cache directory")
-    p.add_argument("--guidance_scale", type=float, default=3.5)
-    p.add_argument("--num_inference_steps", type=int, default=50)
+    # If unset, defaults are chosen per pipeline kind (FLUX: 3.5/50, SD3: 4.5/28).
+    p.add_argument("--guidance_scale", type=float, default=None,
+                   help="Override pipeline-kind default")
+    p.add_argument("--num_inference_steps", type=int, default=None,
+                   help="Override pipeline-kind default")
     # ── Sharding: split prompts within a topic across multiple GPUs ──────────
     p.add_argument("--num_shards", type=int, default=1,
                    help="Number of GPU shards (default: 1 = no sharding)")
     p.add_argument("--shard_rank", type=int, default=0,
                    help="This shard's rank 0-indexed. Saves manifest_shard_{rank}.json")
+    # ── Keep-alive: hold the pipeline on GPU after generation completes ──────
+    p.add_argument("--keep_alive", action="store_true",
+                   help="After all topics are done, idle in a sleep loop with "
+                        "the pipeline still on GPU. Release with SIGINT/SIGTERM.")
+    p.add_argument("--done_flag_dir", default=None,
+                   help="If set, touch <dir>/shard_<rank>.done after the topic "
+                        "loop (before any keep-alive sleep). The shell launcher "
+                        "polls this so manifest merge can run even while pythons "
+                        "are still idling on GPU.")
     return p.parse_args()
 
 
@@ -67,21 +79,60 @@ def model_dir_name(model_id: str) -> str:
     return model_id.replace("/", "-")
 
 
-def load_flux_pipe(model_id: str, hf_cache_dir: str):
-    """Load and return a FluxPipeline on cuda. Call once per process."""
-    import torch
-    from diffusers import FluxPipeline
+_PIPE_DEFAULTS = {
+    "flux": {"guidance_scale": 3.5, "num_inference_steps": 50},
+    "sd3":  {"guidance_scale": 4.5, "num_inference_steps": 28},
+    # SD 2.1: leave guidance_scale unset so the HF pipeline default applies.
+    "sd2":  {"guidance_scale": None, "num_inference_steps": 50},
+}
 
-    print(f"  Loading {model_id} ...")
-    pipe = FluxPipeline.from_pretrained(
-        model_id,
-        torch_dtype=torch.bfloat16,
-        cache_dir=hf_cache_dir,
-    ).to("cuda")
+
+def _pipe_kind(model_id: str) -> str:
+    mid = model_id.lower()
+    if "stable-diffusion-3" in mid or "sd3" in mid:
+        return "sd3"
+    if "stable-diffusion-2" in mid or "sd2" in mid:
+        return "sd2"
+    return "flux"
+
+
+def load_pipe(model_id: str, hf_cache_dir: str):
+    """Load and return a T2I pipeline on cuda. Call once per process.
+
+    Dispatches on model_id: SD3.x → StableDiffusion3Pipeline, SD2.x →
+    StableDiffusionPipeline (fp16, safety checker disabled), else FluxPipeline.
+    """
+    import torch
+
+    kind = _pipe_kind(model_id)
+    print(f"  Loading {model_id}  (pipeline kind: {kind}) ...")
+    if kind == "sd3":
+        from diffusers import StableDiffusion3Pipeline
+        pipe = StableDiffusion3Pipeline.from_pretrained(
+            model_id, torch_dtype=torch.bfloat16, cache_dir=hf_cache_dir,
+        ).to("cuda")
+    elif kind == "sd2":
+        from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+        pipe = StableDiffusionPipeline.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16,
+            cache_dir=hf_cache_dir,
+            safety_checker=None,
+            requires_safety_checker=False,
+        )
+        # HF SD 2.1 model card recommends DPM-Solver++ over the default scheduler.
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+        pipe = pipe.to("cuda")
+    else:
+        from diffusers import FluxPipeline
+        pipe = FluxPipeline.from_pretrained(
+            model_id, torch_dtype=torch.bfloat16, cache_dir=hf_cache_dir,
+        ).to("cuda")
+    pipe._pipe_kind = kind
     return pipe
 
 
-def generate_flux(
+def generate(
     prompts: list[str],
     out_dir: Path,
     model_id: str,
@@ -94,17 +145,17 @@ def generate_flux(
     num_inference_steps: int,
     pipe=None,
 ) -> dict[str, list[dict]]:
-    """Generate images with FLUX and return baselines dict.
+    """Generate images and return baselines dict.
 
-    If pipe is None, loads a new FluxPipeline. Pass an existing pipe to reuse
-    across topics within the same process (avoids reloading the model).
+    If pipe is None, loads a new pipeline (FLUX or SD3 per model_id). Pass an
+    existing pipe to reuse across topics within the same process.
     """
     import torch
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if pipe is None:
-        pipe = load_flux_pipe(model_id, hf_cache_dir)
+        pipe = load_pipe(model_id, hf_cache_dir)
 
     from tqdm import tqdm
 
@@ -142,15 +193,18 @@ def generate_flux(
             if img_path.exists():
                 continue
             generator.manual_seed(seed + img_idx)
-            result = pipe(
-                prompt,
+            call_kwargs = dict(
+                prompt=prompt,
                 height=height,
                 width=width,
-                guidance_scale=guidance_scale,
                 num_inference_steps=num_inference_steps,
-                max_sequence_length=512,
                 generator=generator,
             )
+            if guidance_scale is not None:
+                call_kwargs["guidance_scale"] = guidance_scale
+            if getattr(pipe, "_pipe_kind", "flux") == "flux":
+                call_kwargs["max_sequence_length"] = 512
+            result = pipe(**call_kwargs)
             result.images[0].save(img_path)
 
         baselines[prompt] = entries
@@ -183,9 +237,18 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     mdir = model_dir_name(args.model_id)
 
-    # Load FLUX once, reuse across all topics (the model stays on this GPU
+    # Load pipeline once, reuse across all topics (the model stays on this GPU
     # even if a topic has no work to do for this shard).
-    pipe = load_flux_pipe(args.model_id, args.hf_cache_dir)
+    pipe = load_pipe(args.model_id, args.hf_cache_dir)
+
+    # Resolve sampler defaults from pipeline kind unless user overrode them.
+    defaults = _PIPE_DEFAULTS[pipe._pipe_kind]
+    guidance_scale = (args.guidance_scale
+                      if args.guidance_scale is not None else defaults["guidance_scale"])
+    num_inference_steps = (args.num_inference_steps
+                           if args.num_inference_steps is not None else defaults["num_inference_steps"])
+    gs_str = "<pipeline default>" if guidance_scale is None else guidance_scale
+    print(f"  Sampler: guidance_scale={gs_str}, num_inference_steps={num_inference_steps}")
 
     for topic_id in args.topic_ids:
         print(f"\n=== Topic {topic_id} (shard {args.shard_rank}/{args.num_shards}) ===")
@@ -199,7 +262,7 @@ def main() -> None:
         out_dir = output_dir / f"topic_{topic_id}" / mdir
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        baselines = generate_flux(
+        baselines = generate(
             prompts=prompts,
             out_dir=out_dir,
             model_id=args.model_id,
@@ -208,8 +271,8 @@ def main() -> None:
             height=args.image_height,
             seed=args.random_seed,
             hf_cache_dir=args.hf_cache_dir,
-            guidance_scale=args.guidance_scale,
-            num_inference_steps=args.num_inference_steps,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps,
             pipe=pipe,
         )
 
@@ -238,6 +301,25 @@ def main() -> None:
             print(f"  Saved manifest: {manifest_path}")
 
     print("\nDone. Run score_baselines.py to add reward scores.")
+
+    # Signal completion to the launcher BEFORE going idle, so the launcher
+    # can start the manifest merge while we still hold the pipeline on GPU.
+    if args.done_flag_dir:
+        flag_dir = Path(args.done_flag_dir)
+        flag_dir.mkdir(parents=True, exist_ok=True)
+        flag_path = flag_dir / f"shard_{args.shard_rank}.done"
+        flag_path.write_text("")
+        print(f"  Touched done flag: {flag_path}")
+
+    if args.keep_alive:
+        import time
+        print(f"[shard {args.shard_rank}] holding pipeline on GPU. "
+              f"Send SIGINT/SIGTERM to release.", flush=True)
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            print(f"[shard {args.shard_rank}] released.")
 
 
 if __name__ == "__main__":

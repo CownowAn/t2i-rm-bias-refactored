@@ -75,6 +75,9 @@ class DetectorConfig:
     # Prompt content controls
     use_prompt: bool = True    # include the image generation prompt in the detection query
     use_reasoning: bool = True  # request a reasoning field in the JSON response
+    # When True, the model is also asked whether the attribute even applies to the image
+    # (e.g. "rocks are too smooth" on a portrait with no rocks → applicable=false → -1).
+    use_applicability: bool = False
 
 
 @dataclass
@@ -137,6 +140,15 @@ class EvolutionConfig:
     use_cluster_summary: bool = True
     direction: str = "plus"
     image_order: str = "descending"   # order images are shown to the planner LLM
+    # How reward scores are normalized when shown to InitialPlanner.
+    # Stats are computed over the FULL scored pool per prompt (typically 128 imgs),
+    # then applied to the sampled images. Aligns the planner's view with the
+    # within-prompt quantile signal used by downstream OLS.
+    #   "none"     → raw score (current behavior)
+    #   "zscore"   → (r - mean_x) / std_x
+    #   "minmax"   → (r - min_x) / (max_x - min_x), bounded [0, 1]
+    #   "quantile" → within-prompt rank percentile (matches U used by BoN OLS)
+    initial_score_normalization: str = "none"
     context: str = "ancestry"
     mutation_context_source: str = "origin"  # "origin" | "accumulated" | "latest"
     reg_min_pairs: int = 5
@@ -306,6 +318,11 @@ class SearchConfig:
         assert self.evolution.initial_context_sampling in ("random", "stratified"), (
             f"initial_context_sampling must be 'random' or 'stratified', "
             f"got {self.evolution.initial_context_sampling!r}"
+        )
+        assert self.evolution.initial_score_normalization in ("none", "zscore", "minmax", "quantile"), (
+            f"initial_score_normalization must be one of "
+            f"'none', 'zscore', 'minmax', 'quantile', "
+            f"got {self.evolution.initial_score_normalization!r}"
         )
         assert self.pipeline.mode in ("edit", "baseline_pairs", "bon_amplified"), (
             f"pipeline.mode must be 'edit', 'baseline_pairs', or 'bon_amplified', "

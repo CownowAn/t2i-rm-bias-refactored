@@ -17,8 +17,10 @@ mkdir -p "$TMPDIR"
 GPU="0"
 TOPIC_IDS="0 1 2 3 4 5 6 7 8 9"
 MANIFEST=""           # if set, score this single manifest directly (ignores topic_ids)
-MODEL_ID="black-forest-labs/FLUX.1-dev"
-OUTPUT_DIR="/nfs/data/sohyun/baselines/mjhq"
+# MODEL_ID="black-forest-labs/FLUX.1-dev"
+MODEL_ID="stabilityai/stable-diffusion-3.5-medium"
+# OUTPUT_DIR="/nfs/data/sohyun/baselines/mjhq"
+OUTPUT_DIR="/nfs/data/sohyun/projects/t2i-rm-bias/data/baselines/mjhq"
 REWARD_MODEL="imagereward"
 HF_CACHE_DIR="/nfs/data/sohyun/models"
 BATCH_SIZE=32

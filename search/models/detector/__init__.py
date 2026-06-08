@@ -28,5 +28,6 @@ def build_detector(cfg: "DetectorConfig", cache_config: "Optional[CacheConfig]" 
         extra_body=cfg.extra_body,
         use_prompt=cfg.use_prompt,
         use_reasoning=cfg.use_reasoning,
+        use_applicability=getattr(cfg, "use_applicability", False),
         cache_config=cache_config,
     )

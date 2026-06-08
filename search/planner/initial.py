@@ -20,6 +20,36 @@ from search.prompts.planning import (
 from search.utils.io import parse_json_response
 
 
+def _score_label(raw: float, pool: list[float], norm: str) -> str:
+    """Build per-image score label using prompt-level statistics from `pool`.
+
+    `pool` is the FULL scored set for that prompt (typically 128 imgs), so the
+    statistics are stable. `raw` is the score of the specific image being
+    labelled. Supported modes:
+      "none"     → raw score
+      "zscore"   → (raw - mean) / std
+      "minmax"   → (raw - min) / (max - min), bounded [0, 1]
+      "quantile" → rank percentile within pool (right-inclusive)
+    """
+    if norm == "none":
+        return f"Score: {raw:.2f}"
+    if norm == "zscore":
+        import statistics
+        m = statistics.mean(pool)
+        s = statistics.pstdev(pool) or 1.0
+        return f"Score (within-prompt z): {(raw - m) / s:+.2f}"
+    if norm == "minmax":
+        lo, hi = min(pool), max(pool)
+        rng = (hi - lo) or 1.0
+        return f"Score (within-prompt minmax): {(raw - lo) / rng:.2f}"
+    if norm == "quantile":
+        import bisect
+        sorted_pool = sorted(pool)
+        pct = bisect.bisect_right(sorted_pool, raw) / len(pool)
+        return f"Score (within-prompt rank %): {int(round(100 * pct))}"
+    raise ValueError(f"Unknown score_normalization: {norm}")
+
+
 class InitialPlanner:
     """Generates initial attribute hypotheses from scored baseline images (step 0)."""
 
@@ -40,8 +70,14 @@ class InitialPlanner:
         random_seed: int = 42,
         require_editable: bool = True,
         n_prompts_per_plan_call: int = 1,
+        score_normalization: str = "none",
         cache_config: CacheConfig | None = None,
     ):
+        if score_normalization not in ("none", "zscore", "minmax", "quantile"):
+            raise ValueError(
+                f"score_normalization must be one of "
+                f"'none', 'zscore', 'minmax', 'quantile', got {score_normalization!r}"
+            )
         self.model_name = model_name
         self.reasoning = reasoning
         self.max_tokens = max_tokens
@@ -57,6 +93,7 @@ class InitialPlanner:
         self.random_seed = random_seed
         self.require_editable = require_editable
         self.n_prompts_per_plan_call = n_prompts_per_plan_call
+        self.score_normalization = score_normalization
         self.caller = AutoCaller(dotenv_path=".env", cache_config=cache_config)
 
     async def plan(
@@ -72,8 +109,10 @@ class InitialPlanner:
         prompts used for OLS evaluation (fixed baselines).
         """
         await self._plan_impl(
-            topic_states, reward_model_name,
-            target_step_idx=None, fixed_prompts=fixed_prompts,
+            topic_states, 
+            reward_model_name,
+            target_step_idx=None, 
+            fixed_prompts=fixed_prompts,
         )
 
     async def plan_into_step(
@@ -168,17 +207,23 @@ class InitialPlanner:
                         else:
                             sampled = rng.sample(scored, n)
                         sampled.sort(key=lambda b: b.reward_scores[reward_model_name], reverse=reverse)
+                        # Full pool stats are computed from the entire scored set, so
+                        # z-score / min-max / quantile are stable regardless of sampling.
+                        pool = [b.reward_scores[reward_model_name] for b in scored]
                         content.append({"type": "input_text",
                                         "text": f'\n## Group {g_idx}\n**Prompt:** "{prompt_text}"\n'})
                         for baseline in sampled:
-                            score = round(baseline.reward_scores[reward_model_name], 2)
+                            label = _score_label(
+                                baseline.reward_scores[reward_model_name],
+                                pool, self.score_normalization,
+                            )
                             try:
                                 img_url = ChatMessage.image_to_base64_url(str(baseline.image_path))
                             except Exception as e:
                                 logger.warning(f"Failed to load image {baseline.image_path}: {e}")
                                 continue
                             content.append({"type": "input_image", "image_url": img_url, "detail": "auto"})
-                            content.append({"type": "input_text", "text": f"Score: {score}"})
+                            content.append({"type": "input_text", "text": label})
                     post_text = LIST_PROMPT_POST_MULTI.format(
                         n_attrs_per_prompt=self.n_attrs_per_prompt,
                         bias_check=BIAS_CHECK[self.direction],
@@ -209,7 +254,10 @@ class InitialPlanner:
                         else:
                             sampled = rng.sample(scored, n)
                         sampled.sort(key=lambda b: b.reward_scores[reward_model_name], reverse=reverse)
-                        display_scores = [round(b.reward_scores[reward_model_name], 2) for b in sampled]
+                        pool = [b.reward_scores[reward_model_name] for b in scored]
+                        labels = [_score_label(b.reward_scores[reward_model_name],
+                                                pool, self.score_normalization)
+                                  for b in sampled]
                         pre_text = (
                             PLANNER_SYSTEM + "\n\n"
                             + LIST_PROMPT_PRE.format(
@@ -224,14 +272,14 @@ class InitialPlanner:
                             + f"\n\nUser prompt: {prompt_text}\n"
                         )
                         content: list[dict] = [{"type": "input_text", "text": pre_text}]
-                        for baseline, score in zip(sampled, display_scores):
+                        for baseline, label in zip(sampled, labels):
                             try:
                                 img_url = ChatMessage.image_to_base64_url(str(baseline.image_path))
                             except Exception as e:
                                 logger.warning(f"Failed to load image {baseline.image_path}: {e}")
                                 continue
                             content.append({"type": "input_image", "image_url": img_url, "detail": "auto"})
-                            content.append({"type": "input_text", "text": f"Score: {score}"})
+                            content.append({"type": "input_text", "text": label})
                         post_text = LIST_PROMPT_POST.format(
                             n_attrs_per_prompt=self.n_attrs_per_prompt,
                             higher_lower=higher_lower,

@@ -176,6 +176,7 @@ class BonAmplifiedEvolutionEngine:
             random_seed=config.run.random_seed,
             require_editable=False,
             n_prompts_per_plan_call=config.evolution.n_prompts_per_plan_call,
+            score_normalization=config.evolution.initial_score_normalization,
             cache_config=cache_config,
         )
         clusterer = AttributeClusterer(
@@ -355,7 +356,9 @@ class BonAmplifiedEvolutionEngine:
                 f"  [A] Detecting {len(new_attrs_to_detect)} new attrs in {n_images} images"
             )
             new_det = await _detect_all_attributes(
-                self.detector_model, new_attrs_to_detect, fixed_baselines,
+                self.detector_model, 
+                new_attrs_to_detect, 
+                fixed_baselines,
                 existing_cache=detection_cache,
             )
             for image_id, attr_vals in new_det.items():
@@ -445,19 +448,27 @@ class BonAmplifiedEvolutionEngine:
             key = (attr, ts.topic_id)
             if key not in self._all_found:
                 self._all_found[key] = FoundAttribute(
-                    attribute=attr, delta_rm=None, delta_j=None,
+                    attribute=attr, 
+                    delta_rm=None, 
+                    delta_j=None,
                     amplification_score=amp_score,
-                    step_found=step_idx, step_last_survived=step_idx,
-                    topic_id=ts.topic_id, is_undesirable=True,
+                    step_found=step_idx, 
+                    step_last_survived=step_idx,
+                    topic_id=ts.topic_id, 
+                    is_undesirable=True,
                 )
                 ts.surviving[attr] = step_idx
             else:
                 prev = self._all_found[key]
                 self._all_found[key] = FoundAttribute(
-                    attribute=attr, delta_rm=prev.delta_rm, delta_j=prev.delta_j,
+                    attribute=attr, 
+                    delta_rm=prev.delta_rm, 
+                    delta_j=prev.delta_j,
                     amplification_score=amp_score,
-                    step_found=prev.step_found, step_last_survived=step_idx,
-                    topic_id=ts.topic_id, is_undesirable=True,
+                    step_found=prev.step_found, 
+                    step_last_survived=step_idx,
+                    topic_id=ts.topic_id, 
+                    is_undesirable=True,
                 )
 
         # [F] Append BonAmplifiedStep + log

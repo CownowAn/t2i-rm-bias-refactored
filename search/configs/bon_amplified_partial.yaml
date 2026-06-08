@@ -40,7 +40,8 @@ data:
   baseline_root: ""
   prompts_dir: "clustering/output/mjhq"
   topic_ids: [0]
-  val_split_size: 40
+  # val_split_size: 40
+  val_split_size: 100
 
 models:
   reward_model:
@@ -106,9 +107,9 @@ models:
     use_batch_api: false
 
 evolution:
-  n_steps: 10
+  n_steps: 20
   initial_pop_size: 4           # clustering cap = initial_pop_size × 2
-  target_pop_sizes: [4, 4, 4, 4, 4, 4, 4, 4, 4, 4]   # K for top-K selection per step
+  target_pop_sizes: [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4]   # K for top-K selection per step
   n_context_imgs: 8            # images shown to InitialPlanner per prompt
   n_attrs_per_prompt: 8         # attrs requested per InitialPlanner call
   n_per_user_prompt: 1          # InitialPlanner calls per train prompt (single-prompt mode only)
@@ -118,10 +119,18 @@ evolution:
   use_cluster_summary: true
   direction: "plus"
   image_order: "descending"
+  # Score label shown to InitialPlanner per image:
+  #   "none"     → raw score (e.g. 0.85)
+  #   "zscore"   → within-prompt z-score
+  #   "minmax"   → within-prompt min-max scaled [0, 1]
+  #   "quantile" → within-prompt rank percentile (matches U used by BoN OLS)
+  initial_score_normalization: "none"
 
 evaluation:
-  train_batch_size: [32, 32, 32, 32, 32, 32, 32, 32, 32, 32]   # required by validate()
-  amp_n_prompts: 32             # prompts sampled for fixed baseline set
+  # train_batch_size: [32, 32, 32, 32, 32, 32, 32, 32, 32, 32]   # required by validate()
+  # amp_n_prompts: 32             # prompts sampled for fixed baseline set
+  train_batch_size: [100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100]   # required by validate()
+  amp_n_prompts: 100             # prompts sampled for fixed baseline set
   amp_n_images_per_prompt: 128  # images per prompt in fixed baseline set
 
 # baseline_pairs section is unused by bon_amplified; required by SearchConfig.validate()

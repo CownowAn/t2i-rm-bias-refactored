@@ -138,6 +138,7 @@ class VisionLLMDetector(DetectorModel):
         extra_body: dict | None = None,
         use_prompt: bool = True,
         use_reasoning: bool = True,
+        use_applicability: bool = False,
         cache_config: CacheConfig | None = None,
     ):
         self._model_name = model_name
@@ -152,6 +153,7 @@ class VisionLLMDetector(DetectorModel):
         self.extra_body = extra_body
         self.use_prompt = use_prompt
         self.use_reasoning = use_reasoning
+        self.use_applicability = use_applicability
         self.caller = (
             LocalCaller(base_url=vllm_base_url, cache_config=cache_config)
             if vllm_base_url
@@ -168,7 +170,14 @@ class VisionLLMDetector(DetectorModel):
         prompts: list[str],
         attribute: str,
     ) -> list[int]:
-        """Detect whether an attribute is present in each image. Returns list of 0/1."""
+        """Detect whether an attribute is present in each image.
+
+        Returns one int per image:
+          1  → attribute present
+          0  → attribute not present (or parse failed)
+          -1 → attribute does NOT apply to the image (only when
+               `use_applicability=True` and the model said `applicable=false`).
+        """
         if len(image_paths) != len(prompts):
             raise ValueError("image_paths and prompts must have the same length")
 
@@ -181,6 +190,7 @@ class VisionLLMDetector(DetectorModel):
                     prompt=prompt,
                     use_prompt=self.use_prompt,
                     use_reasoning=self.use_reasoning,
+                    use_applicability=self.use_applicability,
                 )
                 if self.vllm_base_url:
                     # vLLM (e.g. Qwen): separate system msg, image before text
@@ -242,7 +252,10 @@ class VisionLLMDetector(DetectorModel):
                     results.append(0)
                     continue
                 data = json.loads(m.group())
-                results.append(1 if data.get("present", False) else 0)
+                if self.use_applicability and data.get("applicable") is False:
+                    results.append(-1)
+                else:
+                    results.append(1 if data.get("present", False) else 0)
             except Exception:
                 results.append(0)
 
