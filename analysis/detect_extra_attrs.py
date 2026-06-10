@@ -118,7 +118,7 @@ async def detect(
     cfg, attrs: list[str], baselines: dict, existing_cache_for_model: dict,
 ) -> dict[str, dict[str, int]]:
     from search.models.detector import build_detector
-    from search.pipeline.baseline_evo import _detect_all_attributes
+    from search.pipeline._shared import _detect_all_attributes
 
     cache_config = cfg.caller_cache.build()
     detector_model = build_detector(cfg.models.detector, cache_config=cache_config)

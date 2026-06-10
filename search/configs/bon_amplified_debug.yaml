@@ -3,9 +3,6 @@ run:
   output_dir: "outputs/search/debug"
   random_seed: 42
 
-pipeline:
-  mode: "bon_amplified"
-
 # ── DEBUG: same as bon_amplified_partial.yaml, smaller scale for a fast run ──
 # Models/detector (Qwen vLLM) unchanged; steps/images/prompts reduced.
 bon_amplified:
@@ -95,19 +92,6 @@ models:
     reasoning: "high"
     max_parallel: 1
 
-  # editor/judge: unused by bon_amplified, kept to satisfy SearchConfig defaults
-  editor:
-    instruction_model: "openai/gpt-4o-mini"
-    flux_model: "black-forest-labs/FLUX.1-Kontext-dev"
-    flux_devices: ["cuda:0"]
-    guidance_scale: 2.5
-  judge:
-    model: "openai/gpt-4o-mini"
-    max_tokens: 10000
-    max_parallel: 32
-    image_detail: "low"
-    use_batch_api: false
-
 evolution:
   n_steps: 2                  # debug: 20→2 (1-2 EXPAND iterations only)
   initial_pop_size: 4        # clustering cap = initial_pop_size × 2 = 4
@@ -124,15 +108,8 @@ evolution:
   initial_score_normalization: "quantile"
 
 evaluation:
-  train_batch_size: [32, 32]  # length == n_steps (validate)
-  amp_n_prompts: 32            # number of fixed-baseline prompts (debug: 100→4)
+  amp_n_prompts: 32            # number of fixed-baseline prompts
   amp_n_images_per_prompt: 32  # images per prompt (detection ≈ amp_n_prompts × this)
-
-# unused by bon_amplified, kept to satisfy validate()
-baseline_pairs:
-  pair_constructor: stratified
-  judge_filter_position: "lazy"
-  regression_model: ridge
 
 caller_cache:
   enabled: false

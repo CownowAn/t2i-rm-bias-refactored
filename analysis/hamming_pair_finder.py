@@ -44,7 +44,9 @@ from debias.counterfactual.selection.per_prompt_w_loader import (  # noqa: E402
     limit_attrs,
     load_per_prompt_w,
 )
-from search.pipeline.baseline_pair_constructor import _hamming  # noqa: E402
+def _hamming(vec_a: dict[str, int], vec_b: dict[str, int], attrs: list[str]) -> int:
+    """Hamming distance between two attribute vectors over the given attr list."""
+    return sum(vec_a.get(a, 0) != vec_b.get(a, 0) for a in attrs)
 from search.pipeline.baselines import (  # noqa: E402
     load_baselines_from_manifest,
     load_topic_states,

@@ -22,7 +22,7 @@ from pathlib import Path
 from loguru import logger
 
 from debias.counterfactual.schemas import EditTask
-from search.models.editor.flux_kontext import FluxKontextApplier
+from debias.counterfactual.edit.flux_kontext import FluxKontextApplier
 from search.utils.async_utils import GpuApplierPool, bounded_gather
 from search.utils.io import save_json
 

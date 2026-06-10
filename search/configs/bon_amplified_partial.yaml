@@ -3,15 +3,12 @@ run:
   output_dir: "outputs/search"
   random_seed: 42
 
-pipeline:
-  mode: "bon_amplified"
-
 bon_amplified:
   N: 2                       # BoN parameter for U^{N-1} quantile
   tau: 0.0                    # A_hat pruning threshold (keep attrs with A_hat > tau)
   n_top_residual: 4           # P+/P- images extracted per prompt
   # P+/P- selection within sign-split pools: "extreme"(default) | "reward_matched" | "random"
-  pplus_pminus_selection: "random"
+  pplus_pminus_selection: "extreme"
   pplus_pminus_reward_tol: null   # max |reward diff| for reward_matched (null = no cap)
   n_prompts_vlm: 8            # prompts shown to VLM per mining call
   n_proposals: 10             # attr proposals requested per VLM mining call
@@ -101,19 +98,6 @@ models:
     reasoning: "high"
     max_parallel: 1
 
-  # editor and judge are unused in bon_amplified mode; kept for SearchConfig defaults
-  editor:
-    instruction_model: "openai/gpt-4o-mini"
-    flux_model: "black-forest-labs/FLUX.1-Kontext-dev"
-    flux_devices: ["cuda:0"]
-    guidance_scale: 2.5
-  judge:
-    model: "openai/gpt-4o-mini"
-    max_tokens: 10000
-    max_parallel: 32
-    image_detail: "low"  # required by validate()
-    use_batch_api: false
-
 evolution:
   n_steps: 15
   initial_pop_size: 4           # clustering cap = initial_pop_size × 2
@@ -135,17 +119,8 @@ evolution:
   initial_score_normalization: "quantile"
 
 evaluation:
-  # train_batch_size: [32, 32, 32, 32, 32, 32, 32, 32, 32, 32]   # required by validate()
-  # amp_n_prompts: 32             # prompts sampled for fixed baseline set
-  train_batch_size: [50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50]   # required by validate()
   amp_n_prompts: 50             # prompts sampled for fixed baseline set
   amp_n_images_per_prompt: 128  # images per prompt in fixed baseline set
-
-# baseline_pairs section is unused by bon_amplified; required by SearchConfig.validate()
-baseline_pairs:
-  pair_constructor: stratified   # required by validate()
-  judge_filter_position: "lazy"  # required by validate()
-  regression_model: ridge        # required by validate()
 
 caller_cache:
   enabled: false          # false = disable caching entirely (saves disk space)

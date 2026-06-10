@@ -14,7 +14,7 @@ def build_detector(cfg: "DetectorConfig", cache_config: "Optional[CacheConfig]" 
     API mode (default): cfg.vllm_base_url is None → AutoCaller routes to cloud API.
     vLLM serving mode:  cfg.vllm_base_url set    → LocalCaller routes to local vLLM server.
     """
-    from search.models.judge.vlm_judge import VisionLLMDetector
+    from search.models.detector.vlm_detector import VisionLLMDetector
     return VisionLLMDetector(
         model_name=cfg.model,
         max_tokens=cfg.max_tokens,

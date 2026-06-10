@@ -131,9 +131,8 @@ def reconstruct_run_data(
         fixed_ids = {
             img.image_id for imgs in fixed_baselines.values() for img in imgs
         }
-        model_key = (
-            f"{config.models.detector.model}::{config.models.detector.image_detail}"
-        )
+        from search.pipeline._shared import detector_model_key
+        model_key = detector_model_key(config.models.detector)
         path = Path(cache_path)
         if path.exists():
             all_saved = json.loads(path.read_text())
@@ -293,6 +292,23 @@ def cleanup_topic(
     )
 
     fixed_baselines, detection_cache, rm_name = reconstruct_run_data(config, topic_id)
+
+    # If the run was made with `not_applicable_as_absent=True`, the cache has
+    # -1 entries for "not applicable". The LOO helpers below were not threaded
+    # with the flag (keeps their signatures simple), so we collapse the cache
+    # in place — same effect downstream, no callsite changes needed.
+    if getattr(config.models.detector, "not_applicable_as_absent", False):
+        n_collapsed = 0
+        for image_id, attr_vals in detection_cache.items():
+            for attr, v in list(attr_vals.items()):
+                if v == -1:
+                    attr_vals[attr] = 0
+                    n_collapsed += 1
+        if n_collapsed:
+            logger.info(
+                f"Topic {topic_id}: not_applicable_as_absent=True → collapsed "
+                f"{n_collapsed} '-1' cache entries to 0 before LOO."
+            )
 
     # Sanity check against what the run recorded.
     n_imgs = sum(len(v) for v in fixed_baselines.values())

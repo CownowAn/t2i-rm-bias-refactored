@@ -14,8 +14,11 @@ following a statistically-grounded prompt-selection pipeline:
        - other-attribute matching: Hamming distance over the *other* attrs
          <= --max_hamming
        - reward filter: r(y+) > r(y-)            (scenario B)
-       - reward-gap cap: r(y+) - r(y-) <= cap    (other-quality control;
-         cap = --max_reward_gap_quantile quantile of within-prompt positive gaps)
+       - neg selection objective (which y-): by default the smallest reward gap
+         r(y+)-r(y-); with --vqascore_key, the smallest |Δvqascore| instead, so
+         the pair is matched on prompt-alignment rather than on reward. The active
+         gap is capped at the --max_reward_gap_quantile quantile of within-prompt
+         scenario-B gaps.
   3. Render each chosen pair to a side-by-side PNG + write pairs.json / pairs.csv.
 
 The regression inputs (G_x, U^{N-1}) are reconstructed *exactly* from the search
@@ -37,7 +40,7 @@ import csv
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -60,12 +63,15 @@ class CounterfactualPair:
     negative_id: str          # image with g_k = 0 (should be preferred)
     reward_pos: float
     reward_neg: float
-    reward_gap: float         # r_pos - r_neg (> 0 by construction)
+    reward_gap: float         # r_pos - r_neg (> 0 by construction, scenario B)
     hamming_distance: int     # other-attribute mismatch count
     w_mean: float             # bootstrap mean of W_xk for this prompt
     w_ci_low: float           # 5th percentile of bootstrap W_xk
     w_ci_high: float          # 95th percentile of bootstrap W_xk
     pair_weight: float        # composite quality weight
+    vqa_pos: float = float("nan")   # VQAScore of the positive image (vqa mode)
+    vqa_neg: float = float("nan")   # VQAScore of the negative image (vqa mode)
+    vqa_gap: float = float("nan")   # |vqa_pos - vqa_neg| — the selection objective in vqa mode
     png_path: str = ""
 
 
@@ -112,11 +118,13 @@ def _find_ppw(search_dir: Path, topic_id: int | None, step: int | None
 
 
 def _load_config(search_dir: Path) -> dict:
-    for name in ("config_effective.yaml", "config_source.yaml"):
-        path = search_dir / name
-        if path.exists():
-            with open(path) as f:
-                return yaml.safe_load(f)
+    # config may sit directly in the run dir or under a configs/ subdir
+    for base in (search_dir, search_dir / "configs"):
+        for name in ("config_effective.yaml", "config_source.yaml"):
+            path = base / name
+            if path.exists():
+                with open(path) as f:
+                    return yaml.safe_load(f)
     return {}
 
 
@@ -142,6 +150,7 @@ class RegressionInputs:
     labels_per_image: dict[str, np.ndarray]      # image_id -> (K,) binary attr vector
     rewards_per_image: dict[str, float]          # image_id -> reward
     path_per_image: dict[str, Path]              # image_id -> image path
+    vqa_per_image: dict[str, float] = field(default_factory=dict)  # image_id -> VQAScore (vqa mode)
 
 
 def build_regression_inputs(
@@ -199,6 +208,23 @@ def build_regression_inputs(
             ri.rewards_per_image[iid] = float(r)
             ri.path_per_image[iid] = _resolve(e["image_path"], baseline_root)
     return ri
+
+
+def load_vqa_scores(manifest_path: Path, key: str) -> dict[str, float]:
+    """image_id -> reward_scores[key] from a manifest (joined by image_id).
+
+    The VQAScore may live in the same manifest as the reward (just another
+    reward_scores key) or in a separate manifest covering the same images.
+    """
+    with open(manifest_path) as f:
+        baselines = json.load(f).get("baselines", {})
+    out: dict[str, float] = {}
+    for entries in baselines.values():
+        for e in entries:
+            v = e.get("reward_scores", {}).get(key)
+            if v is not None:
+                out[e["image_id"]] = float(v)
+    return out
 
 
 def validate_reconstruction(ri: RegressionInputs, ppw: dict) -> float:
@@ -294,31 +320,60 @@ def hamming_distance_other_attrs(a: np.ndarray, b: np.ndarray, exclude_idx: int)
 def find_best_counterfactual(
     y_pos_labels: np.ndarray,
     y_pos_reward: float,
-    negative_candidates: list[tuple[str, np.ndarray, float]],
+    y_pos_vqa: float,
+    negative_candidates: list[tuple[str, np.ndarray, float, float]],
     attribute_idx: int,
     max_hamming: int,
-    max_reward_gap: float,
+    sel_gap_cap: float,
+    use_vqa: bool,
+    vqa_neg_higher: bool = False,
     hamming_weight: float = 0.5,
-) -> tuple[str, int, float] | None:
-    """Best y_neg (g_k=0) for a given y_pos (g_k=1): Hamming<=cap, r_pos>r_neg,
-    gap<=cap. Best = minimize weighted (hamming, normalized gap). Returns
-    (neg_id, hamming, gap) or None."""
-    candidates: list[tuple[str, int, float]] = []
-    for neg_id, neg_labels, neg_reward in negative_candidates:
+) -> tuple[str, int, float, float, float] | None:
+    """Best y_neg (g_k=0) for a given y_pos (g_k=1).
+
+    Filters (always): Hamming<=max_hamming, and r_pos>r_neg (scenario B — the
+    biased image must be the reward-winner, defining the bias direction).
+
+    Selection objective ("which neg"):
+      - reward mode (use_vqa=False): minimize the reward gap r_pos-r_neg
+      - vqa mode    (use_vqa=True):  minimize the vqa selection-gap, so the pair
+        is matched on prompt-alignment instead of on reward:
+          * vqa_neg_higher=False: minimize |vqa_pos - vqa_neg| (symmetric)
+          * vqa_neg_higher=True:  require vqa_neg >= vqa_pos (the non-biased
+            "winner" is at least as well-aligned) and minimize vqa_neg - vqa_pos
+    The active gap is also capped at `sel_gap_cap`. Best = minimize weighted
+    (hamming, normalized selection-gap).
+
+    negative_candidates items: (neg_id, neg_labels, neg_reward, neg_vqa).
+    Returns (neg_id, hamming, reward_gap, neg_vqa, sel_gap) or None.
+    """
+    candidates: list[tuple[str, int, float, float, float]] = []
+    for neg_id, neg_labels, neg_reward, neg_vqa in negative_candidates:
         h = hamming_distance_other_attrs(y_pos_labels, neg_labels, attribute_idx)
         if h > max_hamming:
             continue
-        gap = y_pos_reward - neg_reward
-        if gap <= 0 or gap > max_reward_gap:
+        reward_gap = y_pos_reward - neg_reward
+        if reward_gap <= 0:                       # scenario B (always)
             continue
-        candidates.append((neg_id, h, gap))
+        if use_vqa:
+            if vqa_neg_higher:
+                sel_gap = neg_vqa - y_pos_vqa     # neg (winner) must be >= aligned
+                if sel_gap < 0:
+                    continue
+            else:
+                sel_gap = abs(y_pos_vqa - neg_vqa)
+        else:
+            sel_gap = reward_gap
+        if sel_gap > sel_gap_cap:
+            continue
+        candidates.append((neg_id, h, reward_gap, neg_vqa, sel_gap))
     if not candidates:
         return None
 
-    def score(item: tuple[str, int, float]) -> float:
-        _, h, gap = item
+    def score(item: tuple[str, int, float, float, float]) -> float:
+        _, h, _, _, sel_gap = item
         h_norm = h / max(max_hamming, 1)
-        gap_norm = gap / max(max_reward_gap, 1e-9)
+        gap_norm = sel_gap / max(sel_gap_cap, 1e-12)
         return hamming_weight * h_norm + (1 - hamming_weight) * gap_norm
 
     candidates.sort(key=score)
@@ -326,12 +381,13 @@ def find_best_counterfactual(
 
 
 def compute_pair_weight(
-    hamming: int, reward_gap: float, w_mean: float, w_ci_low: float,
-    w_ci_high: float, max_hamming: int, max_reward_gap: float,
+    hamming: int, sel_gap: float, sel_gap_cap: float, w_mean: float,
+    w_ci_low: float, w_ci_high: float, max_hamming: int,
 ) -> float:
-    """Higher for better-matched (low hamming), small-gap, high-confidence pairs."""
+    """Higher for better-matched (low hamming), small selection-gap (reward gap
+    or |Δvqa|), high-confidence pairs."""
     hamming_score = 1.0 - hamming / max(max_hamming, 1)
-    gap_score = 1.0 - reward_gap / max(max_reward_gap, 1e-9)
+    gap_score = 1.0 - sel_gap / max(sel_gap_cap, 1e-12)
     ci_width = max(w_ci_high - w_ci_low, 1e-9)
     confidence_score = float(np.clip(w_mean / ci_width, 0.0, 5.0)) / 5.0
     return (hamming_score + gap_score + confidence_score) / 3.0
@@ -343,11 +399,33 @@ def build_counterfactual_pairs(
     boot_stats: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
     target_attributes: list[int],
     max_hamming: int,
-    max_reward_gap_quantile: float,
+    gap_quantile: float,
     max_pairs_per_prompt: int,
+    use_vqa: bool = False,
+    vqa_neg_higher: bool = False,
 ) -> dict[int, list[CounterfactualPair]]:
-    """Build counterfactual pairs for each target attribute."""
+    """Build counterfactual pairs for each target attribute.
+
+    The neg image for each pos is chosen to minimize the *selection gap*:
+    the reward gap (default) or |Δvqascore| (use_vqa=True). In both cases the
+    scenario-B filter r_pos>r_neg is enforced, so vqa mode keeps the same biased
+    images but matches the pair on prompt-alignment rather than on reward.
+    """
     pairs_per_attribute: dict[int, list[CounterfactualPair]] = {}
+    nan = float("nan")
+    vqa = ri.vqa_per_image
+
+    def sel_gap_of(pos_id: str, neg_id: str) -> float | None:
+        """Active selection gap for a (pos, neg) pair, or None if undefined / excluded."""
+        if use_vqa:
+            vp, vn = vqa.get(pos_id), vqa.get(neg_id)
+            if vp is None or vn is None:
+                return None
+            if vqa_neg_higher:
+                d = vn - vp                       # neg (winner) must be >= aligned
+                return d if d >= 0 else None
+            return abs(vp - vn)
+        return ri.rewards_per_image[pos_id] - ri.rewards_per_image[neg_id]
 
     for attr_k in target_attributes:
         attr_name = ri.attrs[attr_k]
@@ -357,7 +435,8 @@ def build_counterfactual_pairs(
             pairs_per_attribute[attr_k] = []
             continue
 
-        # adaptive reward-gap cap from within-prompt positive gaps across reliable prompts
+        # adaptive cap on the active selection gap, over within-prompt scenario-B
+        # candidate (pos, neg) pairs across reliable prompts.
         all_gaps: list[float] = []
         for r in reliable:
             ids = ri.image_ids_per_prompt[r.prompt]
@@ -365,50 +444,60 @@ def build_counterfactual_pairs(
             neg = [i for i in ids if ri.labels_per_image[i][attr_k] == 0]
             for p in pos:
                 for ng in neg:
-                    g = ri.rewards_per_image[p] - ri.rewards_per_image[ng]
-                    if g > 0:
+                    if ri.rewards_per_image[p] - ri.rewards_per_image[ng] <= 0:
+                        continue                          # scenario B
+                    g = sel_gap_of(p, ng)
+                    if g is not None:
                         all_gaps.append(g)
         if not all_gaps:
             pairs_per_attribute[attr_k] = []
             continue
-        max_reward_gap = float(np.quantile(all_gaps, max_reward_gap_quantile))
+        sel_gap_cap = float(np.quantile(all_gaps, gap_quantile))
 
         pairs: list[CounterfactualPair] = []
         for r in reliable:
             ids = ri.image_ids_per_prompt[r.prompt]
-            pos_imgs = [(i, ri.labels_per_image[i], ri.rewards_per_image[i])
+            pos_imgs = [(i, ri.labels_per_image[i], ri.rewards_per_image[i],
+                         vqa.get(i, nan))
                         for i in ids if ri.labels_per_image[i][attr_k] == 1]
-            neg_imgs = [(i, ri.labels_per_image[i], ri.rewards_per_image[i])
+            neg_imgs = [(i, ri.labels_per_image[i], ri.rewards_per_image[i],
+                         vqa.get(i, nan))
                         for i in ids if ri.labels_per_image[i][attr_k] == 0]
+            if use_vqa:                          # need a defined vqa to match on it
+                pos_imgs = [t for t in pos_imgs if t[3] == t[3]]   # drop NaN
+                neg_imgs = [t for t in neg_imgs if t[3] == t[3]]
             if not pos_imgs or not neg_imgs:
                 continue
-            pos_imgs.sort(key=lambda t: -t[2])  # strongest-biased positives first
+            pos_imgs.sort(key=lambda t: -t[2])   # strongest-biased positives first
 
             used_neg: set[str] = set()
-            for y_pos_id, y_pos_labels, y_pos_reward in pos_imgs:
+            for y_pos_id, y_pos_labels, y_pos_reward, y_pos_vqa in pos_imgs:
                 if len([p for p in pairs if p.prompt == r.prompt]) >= max_pairs_per_prompt:
                     break
-                cand = [(i, l, rw) for i, l, rw in neg_imgs if i not in used_neg]
+                cand = [t for t in neg_imgs if t[0] not in used_neg]
                 if not cand:
                     break
                 match = find_best_counterfactual(
-                    y_pos_labels, y_pos_reward, cand, attr_k,
-                    max_hamming, max_reward_gap,
+                    y_pos_labels, y_pos_reward, y_pos_vqa, cand, attr_k,
+                    max_hamming, sel_gap_cap, use_vqa, vqa_neg_higher,
                 )
                 if match is None:
                     continue
-                neg_id, hamming, gap = match
+                neg_id, hamming, reward_gap, neg_vqa, sel_gap = match
                 weight = compute_pair_weight(
-                    hamming, gap, r.w_mean, r.w_ci_low, r.w_ci_high,
-                    max_hamming, max_reward_gap,
+                    hamming, sel_gap, sel_gap_cap, r.w_mean, r.w_ci_low,
+                    r.w_ci_high, max_hamming,
                 )
                 pairs.append(CounterfactualPair(
                     attribute_idx=attr_k, attribute=attr_name, prompt=r.prompt,
                     positive_id=y_pos_id, negative_id=neg_id,
-                    reward_pos=y_pos_reward, reward_neg=y_pos_reward - gap,
-                    reward_gap=gap, hamming_distance=hamming,
+                    reward_pos=y_pos_reward, reward_neg=y_pos_reward - reward_gap,
+                    reward_gap=reward_gap, hamming_distance=hamming,
                     w_mean=r.w_mean, w_ci_low=r.w_ci_low, w_ci_high=r.w_ci_high,
                     pair_weight=weight,
+                    vqa_pos=(y_pos_vqa if use_vqa else nan),
+                    vqa_neg=(neg_vqa if use_vqa else nan),
+                    vqa_gap=(sel_gap if use_vqa else nan),
                 ))
                 used_neg.add(neg_id)
 
@@ -481,6 +570,11 @@ def render_pair(out_path: Path, pair: CounterfactualPair, ri: RegressionInputs,
            f"gap={pair.reward_gap:.3f}  |  hamming={pair.hamming_distance}  "
            f"weight={pair.pair_weight:.3f}"]
     )
+    if pair.vqa_gap == pair.vqa_gap:   # not NaN → vqa mode (selection objective)
+        header = header + [
+            f"vqascore [SELECTION]: pos={pair.vqa_pos:.4g}  neg={pair.vqa_neg:.4g}  "
+            f"|Δ|={pair.vqa_gap:.4g}"
+        ]
     line_h, label_h = 20, 22
     header_h = pad + line_h * len(header) + pad
     H = header_h + label_h + th + pad
@@ -491,10 +585,13 @@ def render_pair(out_path: Path, pair: CounterfactualPair, ri: RegressionInputs,
     for i, ln in enumerate(header):
         draw.text((pad, y), ln, fill="black", font=f_h if i == 0 else f_b)
         y += line_h
-    draw.text((pad, header_h), f"POS (g_k=1)  R={pair.reward_pos:.3f}",
-              fill=(150, 0, 0), font=f_b)
-    draw.text((tw + 2 * pad, header_h), f"NEG (g_k=0)  R={pair.reward_neg:.3f}",
-              fill=(0, 100, 0), font=f_b)
+    pos_lbl = f"POS (g_k=1)  R={pair.reward_pos:.3f}"
+    neg_lbl = f"NEG (g_k=0)  R={pair.reward_neg:.3f}"
+    if pair.vqa_pos == pair.vqa_pos:   # not NaN → vqa mode: show each image's VQAScore
+        pos_lbl += f"  VQA={pair.vqa_pos:.4g}"
+        neg_lbl += f"  VQA={pair.vqa_neg:.4g}"
+    draw.text((pad, header_h), pos_lbl, fill=(150, 0, 0), font=f_b)
+    draw.text((tw + 2 * pad, header_h), neg_lbl, fill=(0, 100, 0), font=f_b)
     iy = header_h + label_h
     canvas.paste(pos, (pad, iy))
     canvas.paste(neg, (tw + 2 * pad, iy))
@@ -521,6 +618,9 @@ def summarize_pairs(pairs_per_attribute: dict[int, list[CounterfactualPair]],
             "mean_weight": float(np.mean([p.pair_weight for p in pairs])),
             "min_w_ci_low": float(min(p.w_ci_low for p in pairs)),
         }
+        vqa_gaps = [p.vqa_gap for p in pairs if p.vqa_gap == p.vqa_gap]
+        if vqa_gaps:
+            summary[attr_k]["mean_vqa_gap"] = float(np.mean(vqa_gaps))
     return summary
 
 
@@ -574,6 +674,22 @@ def main() -> None:
     flag = "OK" if max_diff < 1e-6 else "!! MISMATCH — check --reward / --N"
     print(f"[recon] max|W_recomputed - W_saved| = {max_diff:.2e}  [{flag}]")
 
+    # ── (optional) VQAScore: select neg by min |Δvqascore| instead of reward gap ──
+    use_vqa = bool(args.vqascore_key)
+    if use_vqa:
+        vqa_manifest = args.vqascore_manifest or manifest
+        ri.vqa_per_image = load_vqa_scores(vqa_manifest, args.vqascore_key)
+        ids = list(ri.rewards_per_image)
+        cov = sum(1 for i in ids if i in ri.vqa_per_image)
+        print(f"[vqa] key={args.vqascore_key}  from {vqa_manifest}")
+        print(f"[vqa] {len(ri.vqa_per_image)} scores loaded; coverage "
+              f"{cov}/{len(ids)} reconstructed images  → selecting neg by min |Δvqascore|")
+        if cov == 0:
+            raise ValueError(
+                "no image_id overlap between the vqascore manifest and the "
+                "reconstructed images — check --vqascore_manifest / --manifest match the same image set."
+            )
+
     # ── bootstrap reliability (once per prompt) ──
     rng = np.random.default_rng(args.seed)
     boot_stats = {
@@ -587,8 +703,10 @@ def main() -> None:
     pairs_per_attr = build_counterfactual_pairs(
         ri=ri, boot_stats=boot_stats, target_attributes=target_attrs,
         max_hamming=args.max_hamming,
-        max_reward_gap_quantile=args.max_reward_gap_quantile,
+        gap_quantile=args.max_reward_gap_quantile,
         max_pairs_per_prompt=args.max_pairs_per_prompt,
+        use_vqa=use_vqa,
+        vqa_neg_higher=args.vqa_neg_higher,
     )
 
     # ── render + write ──
@@ -606,7 +724,8 @@ def main() -> None:
         for pair in pairs:
             rank = prompt_rank.get(pair.prompt, 0)
             prompt_rank[pair.prompt] = rank + 1
-            png = attr_dir / f"{_short(pair.prompt)}_r{rank}_h{pair.hamming_distance}_gap{pair.reward_gap:.3f}.png"
+            tag = f"vqagap{pair.vqa_gap:.4f}" if use_vqa else f"gap{pair.reward_gap:.3f}"
+            png = attr_dir / f"{_short(pair.prompt)}_r{rank}_h{pair.hamming_distance}_{tag}.png"
             if render_pair(png, pair, ri, reward_name):
                 pair.png_path = str(png)
                 n_rendered += 1
@@ -619,8 +738,11 @@ def main() -> None:
         json.dump({
             "topic_id": topic_id, "step": step, "reward": reward_name, "N": N,
             "detector_key": det_key, "n_boot": args.n_boot,
+            "selection": "vqa" if use_vqa else "reward",
+            "vqascore_key": args.vqascore_key if use_vqa else None,
+            "vqa_neg_higher": args.vqa_neg_higher if use_vqa else None,
             "max_hamming": args.max_hamming,
-            "max_reward_gap_quantile": args.max_reward_gap_quantile,
+            "gap_quantile": args.max_reward_gap_quantile,
             "max_pairs_per_prompt": args.max_pairs_per_prompt,
             "recon_max_diff": max_diff,
             "n_pairs": len(all_records),
@@ -668,8 +790,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_hamming", type=int, default=2,
                    help="Max Hamming distance over OTHER attrs (0 = strict counterfactual).")
     p.add_argument("--max_reward_gap_quantile", type=float, default=0.75,
-                   help="Gap cap = this quantile of within-prompt positive gaps.")
+                   help="Cap on the active selection gap = this quantile of within-prompt "
+                        "scenario-B gaps (reward gap, or |Δvqascore| when --vqascore_key is set).")
     p.add_argument("--max_pairs_per_prompt", type=int, default=5)
+    # VQAScore-based neg selection (instead of min reward gap)
+    p.add_argument("--vqascore_key", default=None,
+                   help="If set (e.g. 'vqascore_qwen2.5-vl-7b'), pick the neg image by "
+                        "min |Δvqascore| instead of min reward gap. Scenario B (r_pos>r_neg) "
+                        "still applies. Read from reward_scores[key] in the manifest.")
+    p.add_argument("--vqascore_manifest", type=Path, default=None,
+                   help="Manifest holding the vqascore (joined by image_id). "
+                        "Default: same as --manifest.")
+    p.add_argument("--vqa_neg_higher", action="store_true",
+                   help="Require the neg (non-biased winner) to be at least as "
+                        "well-aligned: vqa_neg >= vqa_pos, then minimize vqa_neg - vqa_pos. "
+                        "Avoids promoting a worse-aligned image. (Default: symmetric min |Δvqa|.)")
     # output
     p.add_argument("--out_dir", type=Path, default=None,
                    help="Default: outputs/cf_pairs/topic{T}_step{N}")

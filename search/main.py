@@ -13,20 +13,54 @@ from loguru import logger
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="T2I reward-model bias evolutionary search")
-    parser.add_argument("--config", required=True, help="Path to YAML config file")
+    parser.add_argument("--config", default=None,
+                        help="Path to YAML config file. Required unless --resume_from "
+                             "is given, in which case the resumed run's "
+                             "configs/config_effective.yaml is used.")
+    parser.add_argument("--resume_from", type=Path, default=None,
+                        help="Path to an existing run dir (e.g. outputs/search/20260609-140932). "
+                             "Loads its config_effective.yaml, redirects output to the "
+                             "same dir, auto-detects the highest completed "
+                             "ba_expand_step{N}_topic*.json across topics, and continues "
+                             "from step N+1.")
     parser.add_argument(
         "overrides",
         nargs="*",
         help="Dot-path overrides, e.g. evolution.n_steps=3 run.name=exp01",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.config is None and args.resume_from is None:
+        parser.error("must supply --config or --resume_from")
+    return args
 
 
 async def main() -> None:
     args = parse_args()
 
     from search.config import SearchConfig
-    config = SearchConfig.from_yaml(args.config, overrides=args.overrides or [])
+
+    # Resume mode: load config from the resumed run's configs/config_effective.yaml
+    # (unless --config explicitly overrides) and force output back into the same dir.
+    resume_from: Path | None = args.resume_from
+    if resume_from is not None:
+        resume_from = resume_from.resolve()
+        if not resume_from.is_dir():
+            raise SystemExit(f"--resume_from: not a directory: {resume_from}")
+        cfg_source = args.config
+        if cfg_source is None:
+            cfg_source = resume_from / "configs" / "config_effective.yaml"
+            if not cfg_source.exists():
+                cfg_source = resume_from / "config_effective.yaml"  # legacy layout
+            if not cfg_source.exists():
+                raise SystemExit(
+                    f"--resume_from: no config_effective.yaml under {resume_from}"
+                )
+        config = SearchConfig.from_yaml(cfg_source, overrides=args.overrides or [])
+        # Force run output back into the existing dir.
+        config.run.output_dir = str(resume_from.parent)
+        config.run.name = resume_from.name
+    else:
+        config = SearchConfig.from_yaml(args.config, overrides=args.overrides or [])
     config.validate()
 
     # Configure loguru
@@ -40,10 +74,18 @@ async def main() -> None:
     logger.add(str(debug_log_path), level="DEBUG", rotation="50 MB")
 
     # Save the original config yaml and the effective config (with CLI overrides applied)
+    # In resume mode, preserve the original config_source.yaml and write the
+    # post-override effective config to a timestamped sidecar instead of
+    # overwriting the existing one.
     configs_dir = Path(config.run_output_dir()) / "configs"
     configs_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy(args.config, configs_dir / "config_source.yaml")
-    effective_config_path = configs_dir / "config_effective.yaml"
+    if resume_from is None:
+        shutil.copy(args.config, configs_dir / "config_source.yaml")
+        effective_config_path = configs_dir / "config_effective.yaml"
+    else:
+        from search.utils.io import timestamp as _ts
+        effective_config_path = configs_dir / f"config_effective_resumed_{_ts()}.yaml"
+        logger.info(f"Resuming run: {resume_from}")
     with open(effective_config_path, "w") as f:
         yaml.dump(config.to_dict(), f, default_flow_style=False, allow_unicode=True)
 
@@ -61,17 +103,10 @@ async def main() -> None:
         output_dir=Path(config.run_output_dir()),
     )
 
-    if config.pipeline.mode == "edit":
-        from search.pipeline.evolution import EvolutionEngine
-        engine = EvolutionEngine.from_config(config, tracker=tracker)
-    elif config.pipeline.mode == "baseline_pairs":
-        from search.pipeline.baseline_evo import BaselinePairEvolutionEngine
-        engine = BaselinePairEvolutionEngine.from_config(config, tracker=tracker)
-    elif config.pipeline.mode == "bon_amplified":
-        from search.pipeline.bon_amplified_evo import BonAmplifiedEvolutionEngine
-        engine = BonAmplifiedEvolutionEngine.from_config(config, tracker=tracker)
-    else:
-        raise ValueError(f"Unknown pipeline.mode: {config.pipeline.mode!r}")
+    from search.pipeline.bon_amplified_evo import BonAmplifiedEvolutionEngine
+    engine = BonAmplifiedEvolutionEngine.from_config(
+        config, tracker=tracker, resume_from_dir=resume_from,
+    )
 
     try:
         results = await engine.run()

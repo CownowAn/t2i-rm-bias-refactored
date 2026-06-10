@@ -210,6 +210,23 @@ def _run_for_topic(
         return []
 
     detection_cache = _load_detection_caches(cfg, topic_id, extra_cache_paths)
+
+    # If the run was made with `not_applicable_as_absent=True`, the cache has
+    # -1 entries marking "not applicable". Treat them as absent (=0) so the
+    # OLS sees the same values the live search did.
+    if cfg.get("models", {}).get("detector", {}).get("not_applicable_as_absent", False):
+        n_collapsed = 0
+        for image_id, attr_vals in detection_cache.items():
+            for attr, v in list(attr_vals.items()):
+                if v == -1:
+                    attr_vals[attr] = 0
+                    n_collapsed += 1
+        if n_collapsed:
+            print(
+                f"  topic {topic_id}: not_applicable_as_absent=True → "
+                f"collapsed {n_collapsed} '-1' cache entries to 0"
+            )
+
     print(
         f"  topic {topic_id}: val prompts={n_val_prompts_loaded}, "
         f"detection-cached images={len(detection_cache)}, ols_mode={mode}"

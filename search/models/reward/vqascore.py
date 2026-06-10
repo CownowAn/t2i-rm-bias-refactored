@@ -7,6 +7,7 @@ reward_scores['vqascore_{vqa_model}'] so multiple backbones coexist without clob
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -72,7 +73,12 @@ class VQAScoreModel(RewardModel):
             with torch.no_grad():
                 scores = self._model.batch_forward(dataset=dataset, batch_size=n)
             flat = scores.reshape(n, -1)[:, 0]
-            return [RatingResult(score=float(flat[i])) for i in range(n)]
+            results = []
+            for i in range(n):
+                score = float(flat[i])
+                logger.debug(f"Rated {Path(image_paths[i]).name}: score={score:.3f}")
+                results.append(RatingResult(score=score))
+            return results
         except Exception as e:
             logger.warning(f"VQAScore batch_forward failed ({e}); falling back to per-pair")
 

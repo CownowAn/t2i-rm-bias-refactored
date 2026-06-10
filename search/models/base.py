@@ -9,13 +9,6 @@ class RatingResult:
     reasoning: str | None = None
 
 
-@dataclass(frozen=True)
-class ComparisonResult:
-    winner: str | None          # "A" | "B" | "Tie" | None
-    score_diff: float | None    # +1.0 (A wins), -1.0 (B wins), 0.0 (Tie)
-    reasoning: str | None = None
-
-
 class RewardModel(ABC):
     @property
     @abstractmethod
@@ -27,23 +20,6 @@ class RewardModel(ABC):
         image_paths: list[str],
         prompts: list[str],
     ) -> list[RatingResult]: ...
-
-    @abstractmethod
-    def to_dict(self) -> dict[str, Any]: ...
-
-
-class JudgeModel(ABC):
-    @property
-    @abstractmethod
-    def model_name(self) -> str: ...
-
-    @abstractmethod
-    async def compare(
-        self,
-        image_A_paths: list[str],
-        image_B_paths: list[str],
-        prompts: list[str],
-    ) -> list[ComparisonResult]: ...
 
     @abstractmethod
     def to_dict(self) -> dict[str, Any]: ...

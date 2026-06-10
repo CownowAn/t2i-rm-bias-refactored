@@ -1,4 +1,8 @@
-"""Config system: YAML → dataclasses with dot-path CLI overrides."""
+"""Config system: YAML → dataclasses with dot-path CLI overrides.
+
+Single supported pipeline: BoN-amplified search. The legacy ``edit`` and
+``baseline_pairs`` modes have been removed; their config classes are gone too.
+"""
 from __future__ import annotations
 
 import copy
@@ -38,23 +42,6 @@ class RewardModelConfig:
 
 
 @dataclass
-class EditorConfig:
-    instruction_model: str = "openai/gpt-4o-mini"
-    flux_model: str = "black-forest-labs/FLUX.1-Kontext-dev"
-    flux_devices: list[str] = field(default_factory=lambda: ["cuda:0"])
-    guidance_scale: float = 2.5
-
-
-@dataclass
-class JudgeConfig:
-    model: str = "openai/gpt-4o-mini"
-    max_tokens: int = 50000
-    max_parallel: int = 32
-    image_detail: str = "auto"  # "auto" | "high" | "low"
-    use_batch_api: bool = False  # use OpenAI Batch API (50% discount, async; openai/ models only)
-
-
-@dataclass
 class DetectorConfig:
     model: str = "openai/gpt-4o-mini"
     max_tokens: int = 50000
@@ -79,8 +66,9 @@ class DetectorConfig:
     # When True, the model is also asked whether the attribute even applies to the image
     # (e.g. "rocks are too smooth" on a portrait with no rocks → applicable=false → -1).
     use_applicability: bool = False
-    # When use_applicability=True, collapse the "not applicable" verdict (-1) to absent (0)
-    # so detection stays binary 0/1 in the cache and downstream. No effect if use_applicability=False.
+    # When use_applicability=True, the detector still writes -1 ("not applicable") to
+    # the cache (so disk preserves the raw signal), but downstream OLS / amplification
+    # code treats -1 as absent (0). No effect if use_applicability=False.
     not_applicable_as_absent: bool = False
 
 
@@ -121,8 +109,6 @@ class ClusterConfig:
 @dataclass
 class ModelsConfig:
     reward_model: RewardModelConfig = field(default_factory=RewardModelConfig)
-    editor: EditorConfig = field(default_factory=EditorConfig)
-    judge: JudgeConfig = field(default_factory=JudgeConfig)
     detector: DetectorConfig = field(default_factory=DetectorConfig)
     planner: PlannerConfig = field(default_factory=PlannerConfig)
     attr_filter: AttrFilterConfig = field(default_factory=AttrFilterConfig)
@@ -135,7 +121,6 @@ class EvolutionConfig:
     n_steps: int = 5
     initial_pop_size: int = 8
     target_pop_sizes: list[int] = field(default_factory=lambda: [4, 4, 4, 4, 4])
-    n_mutations: int = 1
     n_context_imgs: int = 16
     n_attrs_per_prompt: int = 4
     n_per_user_prompt: int = 1
@@ -153,25 +138,13 @@ class EvolutionConfig:
     #   "minmax"   → (r - min_x) / (max_x - min_x), bounded [0, 1]
     #   "quantile" → within-prompt rank percentile (matches U used by BoN OLS)
     initial_score_normalization: str = "none"
-    context: str = "ancestry"
-    mutation_context_source: str = "origin"  # "origin" | "accumulated" | "latest"
-    reg_min_pairs: int = 5
-    cosine_sim_threshold_initial: float = 0.9
-    cosine_sim_threshold_evolution: float = 0.9
-    replan_if_no_undesirable: bool = False
-    strict_undesirable_selection: bool = False
     n_prompts_per_plan_call: int = 1  # >1: show multiple prompts per InitialPlanner VLM call
 
 
 @dataclass
 class EvaluationConfig:
-    train_batch_size: list[int] = field(default_factory=lambda: [32, 32, 32, 32, 32])
-    n_rollouts_per_prompt: int = 1
-    judge_first_n_prompts: int = 32
-    judge_first_n_rollouts: int = 1
     amp_n_prompts: int = 32          # prompts to use for A(g) computation
     amp_n_images_per_prompt: int = 64  # baseline images per prompt for A(g)
-    use_outlier_removal: bool = False
 
 
 @dataclass
@@ -189,12 +162,7 @@ class LoggingConfig:
     console_level: str = "INFO"
 
 
-# ─── Root config ──────────────────────────────────────────────────────────────
-
-@dataclass
-class PipelineConfig:
-    mode: str = "edit"  # "edit" | "baseline_pairs" | "bon_amplified"
-
+# ─── BoN-amplified search config ──────────────────────────────────────────────
 
 @dataclass
 class BonAmplifiedConfig:
@@ -237,43 +205,6 @@ class BonAmplifiedConfig:
 
 
 @dataclass
-class BaselinePairsConfig:
-    n_pairs_per_prompt: int = 20
-    use_judge: bool = True
-    judge_filter_position: str = "before_regression"  # "before_regression" | "before_residual_select" | "lazy"
-    judge_lazy_overshoot: int = 2  # lazy mode: judge n_high_residual_pairs × overshoot top-residual pairs
-    # Prompt diversity controls for lazy judge and high-residual pair selection.
-    # null = no limit.
-    judge_lazy_prompt_cap: int | None = None  # max candidate pairs per prompt for judging
-    n_high_residual_per_prompt: int | None = None  # max pairs per prompt in final high-residual selection
-    n_high_residual_pairs: int = 5
-    n_proposed_per_step: int = 4
-    reg_fit_intercept: bool = True
-    pair_constructor: str = "stratified"  # "hamming" | "stratified" | "all"
-    n_pairs_per_stratum: int = 4          # pairs per (attr_k, prompt) stratum; used when pair_constructor="stratified"
-    # Attr selection filters (applied independently before top-K selection)
-    use_mu_filter: bool = True   # keep only attrs where μ1 > μ0 (global mean across all images)
-    use_amp_filter: bool = False  # keep only attrs where A(g) > 0 (prompt-averaged amplification)
-    # If True, all filter-passing attrs enter acc_pool (no top-K cap).
-    # Recommended with pair_constructor="all" where N grows with K, keeping N/K large.
-    select_all_passing: bool = False
-    # Detection cache persistence: path to JSON file for cross-run reuse of VLM detection results.
-    # null = disabled (fresh detection every run). Specify a path to save after each EVALUATE and
-    # reload on the next run — eliminates detection cost for already-seen (image, attr) pairs.
-    detection_cache_path: str | None = None
-    # Amplification score formula: "kl_rlhf" = p1·p0·(μ1−μ0) i.e. Cov(g,r) proxy;
-    # "bon" = N·p1·p0·(E[U^{N-1}|g=1]−E[U^{N-1}|g=0]) per BoN theorem (amplification.md §4).
-    amp_mode: str = "kl_rlhf"
-    amp_bon_n: int = 16  # Best-of-N sample size N (only used when amp_mode="bon")
-    # Regression model for linear probing (residual computation)
-    regression_model: str = "elasticnet"  # "lasso" | "ridge" | "elasticnet"
-    # Shared hyperparameters
-    elasticnet_l1_ratio: list[float] = field(default_factory=lambda: [0.1, 0.5, 0.9, 1.0])
-    elasticnet_n_alphas: int = 100   # alpha candidates for Lasso/ElasticNet; logspace count for Ridge
-    elasticnet_cv: int = 5
-
-
-@dataclass
 class CallerCacheConfig:
     enabled: bool = True
     base_path: str = ".cache/caller"
@@ -294,8 +225,6 @@ class SearchConfig:
     evolution: EvolutionConfig = field(default_factory=EvolutionConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
-    pipeline: PipelineConfig = field(default_factory=PipelineConfig)
-    baseline_pairs: BaselinePairsConfig = field(default_factory=BaselinePairsConfig)
     bon_amplified: BonAmplifiedConfig = field(default_factory=BonAmplifiedConfig)
     caller_cache: CallerCacheConfig = field(default_factory=CallerCacheConfig)
 
@@ -322,15 +251,8 @@ class SearchConfig:
             f"target_pop_sizes length ({len(self.evolution.target_pop_sizes)}) "
             f"must equal n_steps ({n})"
         )
-        assert len(self.evaluation.train_batch_size) == n, (
-            f"train_batch_size length ({len(self.evaluation.train_batch_size)}) "
-            f"must equal n_steps ({n})"
-        )
         assert self.evolution.direction in ("plus", "minus"), (
             f"direction must be 'plus' or 'minus', got {self.evolution.direction!r}"
-        )
-        assert self.evolution.context in ("all", "ancestry", "vanilla", "residual"), (
-            f"context must be 'all', 'ancestry', 'vanilla', or 'residual'"
         )
         assert self.evolution.initial_context_sampling in ("random", "stratified"), (
             f"initial_context_sampling must be 'random' or 'stratified', "
@@ -340,14 +262,6 @@ class SearchConfig:
             f"initial_score_normalization must be one of "
             f"'none', 'zscore', 'minmax', 'quantile', "
             f"got {self.evolution.initial_score_normalization!r}"
-        )
-        assert self.pipeline.mode in ("edit", "baseline_pairs", "bon_amplified"), (
-            f"pipeline.mode must be 'edit', 'baseline_pairs', or 'bon_amplified', "
-            f"got {self.pipeline.mode!r}"
-        )
-        assert self.baseline_pairs.pair_constructor in ("hamming", "stratified", "all"), (
-            f"baseline_pairs.pair_constructor must be 'hamming', 'stratified', or 'all', "
-            f"got {self.baseline_pairs.pair_constructor!r}"
         )
         assert self.models.reward_model.name in ("imagereward", "pickscore", "hpsv3"), (
             f"models.reward_model.name must be 'imagereward', 'pickscore', or 'hpsv3', "
@@ -360,18 +274,6 @@ class SearchConfig:
         assert self.bon_amplified.pplus_pminus_selection in ("extreme", "reward_matched", "random"), (
             f"bon_amplified.pplus_pminus_selection must be 'extreme', 'reward_matched', or 'random', "
             f"got {self.bon_amplified.pplus_pminus_selection!r}"
-        )
-        assert self.baseline_pairs.regression_model in ("lasso", "ridge", "elasticnet"), (
-            f"baseline_pairs.regression_model must be 'lasso', 'ridge', or 'elasticnet', "
-            f"got {self.baseline_pairs.regression_model!r}"
-        )
-        assert self.baseline_pairs.judge_filter_position in ("before_regression", "before_residual_select", "lazy"), (
-            f"baseline_pairs.judge_filter_position must be 'before_regression', 'before_residual_select', or 'lazy', "
-            f"got {self.baseline_pairs.judge_filter_position!r}"
-        )
-        assert self.models.judge.image_detail in ("auto", "high", "low"), (
-            f"models.judge.image_detail must be 'auto', 'high', or 'low', "
-            f"got {self.models.judge.image_detail!r}"
         )
         assert self.models.detector.image_detail in ("auto", "high", "low"), (
             f"models.detector.image_detail must be 'auto', 'high', or 'low', "
@@ -427,16 +329,13 @@ def _cast_value(s: str) -> Any:
     return s
 
 
-_LEAF_TYPES = {
-    RunConfig, DataConfig, RewardModelConfig, EditorConfig, JudgeConfig,
-    DetectorConfig, PlannerConfig, AttrFilterConfig, ProposerConfig, ClusterConfig, ModelsConfig, EvolutionConfig,
-    EvaluationConfig, WandbConfig, LoggingConfig, PipelineConfig, BaselinePairsConfig,
-    BonAmplifiedConfig, SearchConfig,
-}
-
-
 def _from_dict(cls, data: dict | None) -> Any:
-    """Recursively construct a dataclass from a dict."""
+    """Recursively construct a dataclass from a dict.
+
+    Unknown keys in `data` are silently dropped — this lets us load
+    config_effective.yaml files from older runs that still mention removed
+    fields (e.g. `pipeline`, `baseline_pairs`, `evolution.n_mutations`).
+    """
     if data is None:
         return cls()
     if not isinstance(data, dict):

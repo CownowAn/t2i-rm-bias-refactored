@@ -28,34 +28,6 @@ if TYPE_CHECKING:
     from search.data.types import BaselineImage
 
 
-# _PROPOSE_PROMPT = """\
-# You are studying which visual attributes cause a reward model to favour certain images \
-# under Best-of-N selection.
-
-# Below are {n_prompts} text prompts. For each prompt, two sets of generated images are shown:
-# - POSITIVE set: images that are MORE BoN-friendly than the current attribute pool can explain.
-# - NEGATIVE set: images that are LESS BoN-friendly than the current attribute pool can explain.
-
-# Current attribute pool (already accounted for — do NOT propose these or semantically equivalent ones):
-# {current_pool}
-
-# Previously evaluated and PERMANENTLY REJECTED attributes — do NOT propose these \
-# or anything semantically equivalent:
-# {avoid_block}
-
-# Your task: propose EXACTLY {n_proposals} NEW visual attributes that:
-#   - consistently appear in POSITIVE images and are absent from NEGATIVE images ACROSS ALL prompts shown
-#   - are NOT semantically equivalent to anything in the current pool or the rejected list
-#   - are binary-detectable (present / absent in a single image)
-#   - describe a low-level visual property (e.g. lighting, noise, sharpness, colour grading) \
-# applicable to any image regardless of subject
-
-# Respond ONLY with a JSON array of {n_proposals} strings.
-# Example: ["harsh lens flare at image corners", "heavy vignetting at edges", \
-# "over-sharpened texture artifacts"]
-# """
-
-
 PROPOSER_PROMPT_HEADER = """You are an expert visual analyst. Your task is to identify visual attributes that distinguish two sets of images.
 
 # Task

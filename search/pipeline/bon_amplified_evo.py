@@ -49,16 +49,19 @@ from loguru import logger
 
 from search.data.bon_amplified_types import BonAmplifiedStep
 from search.data.results import SearchResults, FoundAttribute
-from search.data.state import TopicState, EvoStep, AttributeStats, AttributeMeta
+from search.data.state import (
+    TopicState, TopicEngineState, EvoStep, AttributeStats, AttributeMeta,
+)
 from search.pipeline.baselines import load_topic_states, load_baselines_from_manifest, score_baselines
 from search.pipeline.attribute_filter import AttributeUndesirabilityFilter
 from search.utils.io import save_json
-from search.pipeline.baseline_evo import (
+from search.pipeline._shared import (
     _compute_amp_from_detection,
     _detect_all_attributes,
     _all_cached,
     _trim_step,
     _add_to_rejected,
+    detector_model_key,
 )
 from search.planner.bon_residual_proposer import BonResidualProposer
 
@@ -66,6 +69,18 @@ if TYPE_CHECKING:
     from search.config import SearchConfig
     from search.logging.tracker import ExperimentTracker
     from search.data.types import BaselineImage
+
+
+# Per-topic RNG offset added to ``config.run.random_seed`` so different topics
+# sample disjoint fixed-baseline subsets but each topic's sampling is fully
+# reproducible from a single seed. Magic number kept for backward-compat with
+# previously written caches; do not change.
+RNG_TOPIC_OFFSET = 77777
+
+# Variance floor below which a column / target is treated as constant. Used to
+# fall back to a zero-weight solution instead of letting lstsq blow up on a
+# degenerate design.
+OLS_VARIANCE_EPSILON = 1e-10
 
 
 class BonAmplifiedEvolutionEngine:
@@ -81,6 +96,7 @@ class BonAmplifiedEvolutionEngine:
         initial_planner,
         clusterer,
         tracker: "ExperimentTracker",
+        resume_from_dir: "Path | None" = None,
     ):
         self.config = config
         self.topic_states = topic_states
@@ -91,21 +107,14 @@ class BonAmplifiedEvolutionEngine:
         self.initial_planner = initial_planner
         self.clusterer = clusterer
         self.tracker = tracker
+        self.resume_from_dir = resume_from_dir
 
         self._rng = Random(config.run.random_seed)
         self._all_found: dict[tuple[str, int], FoundAttribute] = {}
 
-        self._fixed_baselines: dict[int, dict[str, list]] = {}
-        self._detection_cache: dict[int, dict[str, dict[str, int]]] = {}
-        self._acc_pool: dict[int, list[str]] = {}
-        self._rejected_pool: dict[int, list[str]] = {}
-        # Rejected attrs loaded from the detection cache (previous runs). Kept separate
-        # from _rejected_pool (current run) so the proposer avoid list can exclude them.
-        self._cached_rejected: dict[int, list[str]] = {}
-        # First step at which each attr was admitted to the pool (for age tracking)
-        self._attr_first_seen: dict[int, dict[str, int]] = {}
-        # Cumulative per-prompt R² history across steps (topic_id → list of dicts)
-        self._per_prompt_r2_history: dict[int, list[dict]] = {}
+        # Per-topic engine state. Lazy-init in SETUP; rebuilt in `_load_state_from_artifacts`
+        # when resuming. See `search.data.state.TopicEngineState` for fields.
+        self._estates: dict[int, TopicEngineState] = {}
 
     # ── Factory ───────────────────────────────────────────────────────────────
 
@@ -114,6 +123,7 @@ class BonAmplifiedEvolutionEngine:
         cls,
         config: "SearchConfig",
         tracker: "ExperimentTracker",
+        resume_from_dir: "Path | None" = None,
     ) -> "BonAmplifiedEvolutionEngine":
         from search.models.detector import build_detector
         from search.planner.initial import InitialPlanner
@@ -201,15 +211,16 @@ class BonAmplifiedEvolutionEngine:
             summary_field=config.data.cluster_summary_field,
         )
         return cls(
-            config=config, 
+            config=config,
             topic_states=topic_states,
-            reward_model=reward_model, 
+            reward_model=reward_model,
             detector_model=detector_model,
-            attr_filter=attr_filter, 
+            attr_filter=attr_filter,
             residual_proposer=residual_proposer,
-            initial_planner=initial_planner, 
+            initial_planner=initial_planner,
             clusterer=clusterer,
             tracker=tracker,
+            resume_from_dir=resume_from_dir,
         )
 
     # ── Main run ──────────────────────────────────────────────────────────────
@@ -229,84 +240,91 @@ class BonAmplifiedEvolutionEngine:
         await asyncio.gather(*(score_baselines(ts, self.reward_model) for ts in self.topic_states))
 
         for ts in self.topic_states:
-            rng = Random(cfg.run.random_seed + ts.topic_id + 77777)
+            estate = TopicEngineState()
+            self._estates[ts.topic_id] = estate
+
+            rng = Random(cfg.run.random_seed + ts.topic_id + RNG_TOPIC_OFFSET)
             train_prompts = [
                 p for p in ts.train_prompts() if p in ts.baselines and ts.baselines[p]
             ]
             sample_prompts = rng.sample(
                 train_prompts, min(eval_cfg.amp_n_prompts, len(train_prompts))
             )
-            self._fixed_baselines[ts.topic_id] = {
+            estate.fixed_baselines = {
                 p: rng.sample(
                     ts.baselines[p],
                     min(eval_cfg.amp_n_images_per_prompt, len(ts.baselines[p]))
                 )
                 for p in sample_prompts
             }
-            self._detection_cache[ts.topic_id] = {}
-            self._acc_pool[ts.topic_id] = []
-            self._rejected_pool[ts.topic_id] = []
-            self._cached_rejected[ts.topic_id] = []
-            self._attr_first_seen[ts.topic_id] = {}
-            self._per_prompt_r2_history[ts.topic_id] = []
 
             if ba_cfg.detection_cache_path:
-                _model_key = f"{cfg.models.detector.model}::{cfg.models.detector.image_detail}"
+                _model_key = detector_model_key(cfg.models.detector)
                 self._load_detection_cache(
                     ts.topic_id, Path(ba_cfg.detection_cache_path), _model_key
                 )
-            n_imgs = sum(len(v) for v in self._fixed_baselines[ts.topic_id].values())
+            n_imgs = sum(len(v) for v in estate.fixed_baselines.values())
             logger.info(
                 f"Topic {ts.topic_id}: fixed baselines = "
                 f"{len(sample_prompts)} prompts × up to {eval_cfg.amp_n_images_per_prompt} "
                 f"imgs = {n_imgs} total"
             )
 
-        logger.info("=== Step 0: Initial pool ===")
-        if ba_cfg.initial_pool_path:
-            # Load a pre-filtered pool from a file or a previous run's planner/ dir;
-            # planner + humanness + clustering are skipped.
-            self._load_initial_pool_into_step0(Path(ba_cfg.initial_pool_path))
-        else:
-            fixed_prompts = {
-                ts.topic_id: list(self._fixed_baselines[ts.topic_id].keys())
-                for ts in self.topic_states
-            }
-            await self.initial_planner.plan(
-                self.topic_states, reward_model_name=reward_name, fixed_prompts=fixed_prompts,
+        # Resume: rebuild per-topic state from on-disk ba_expand_step{N}_topic{T}.json
+        # and figure out where to pick up. Returns 0 when no resume is requested or
+        # when no artifacts are found, in which case the normal Step-0 path runs.
+        start_step = self._load_state_from_artifacts() if self.resume_from_dir else 0
+        if start_step > 0:
+            logger.info(
+                f"=== RESUMING at step {start_step} (of {cfg.evolution.n_steps}) ==="
             )
 
-            # [★] Humanness filter on initial pool — before any detection
-            for ts in self.topic_states:
-                if not ts.history:
-                    continue
-                step = ts.history[0]
-                attr_pool = list(step.attributes.keys())
-                if attr_pool:
-                    passed = await self.attr_filter.filter_by_humanness(attr_pool)
-                    failed = set(attr_pool) - set(passed)
-                    _add_to_rejected(self._rejected_pool[ts.topic_id], failed)
-                    _trim_step(step, passed)
-                    self._save_planner_stage("humanness_initial", ts.topic_id, 0, {
-                        "input_attrs": attr_pool,
-                        "passed": passed,
-                        "failed": sorted(failed),
-                        "n_in": len(attr_pool),
-                        "n_out": len(passed),
-                    })
-                    logger.info(
-                        f"Topic {ts.topic_id}: initial humanness filter: "
-                        f"{len(attr_pool)} → {len(passed)} attrs"
-                    )
+        if start_step == 0:
+            logger.info("=== Step 0: Initial pool ===")
+            if ba_cfg.initial_pool_path:
+                # Load a pre-filtered pool from a file or a previous run's
+                # planner/ dir; planner + humanness + clustering are skipped.
+                self._load_initial_pool_into_step0(Path(ba_cfg.initial_pool_path))
+            else:
+                fixed_prompts = {
+                    ts.topic_id: list(self._estates[ts.topic_id].fixed_baselines.keys())
+                    for ts in self.topic_states
+                }
+                await self.initial_planner.plan(
+                    self.topic_states, reward_model_name=reward_name, fixed_prompts=fixed_prompts,
+                )
 
-            for ts in self.topic_states:
-                if ts.history:
-                    await self._cluster_step(ts, step_idx=0, n_pop=cfg.evolution.initial_pop_size)
+                # [★] Humanness filter on initial pool — before any detection
+                for ts in self.topic_states:
+                    if not ts.history:
+                        continue
+                    step = ts.history[0]
+                    attr_pool = list(step.attributes.keys())
+                    if attr_pool:
+                        passed = await self.attr_filter.filter_by_humanness(attr_pool)
+                        failed = set(attr_pool) - set(passed)
+                        _add_to_rejected(self._estates[ts.topic_id].rejected_pool, failed)
+                        _trim_step(step, passed)
+                        self._save_planner_stage("humanness_initial", ts.topic_id, 0, {
+                            "input_attrs": attr_pool,
+                            "passed": passed,
+                            "failed": sorted(failed),
+                            "n_in": len(attr_pool),
+                            "n_out": len(passed),
+                        })
+                        logger.info(
+                            f"Topic {ts.topic_id}: initial humanness filter: "
+                            f"{len(attr_pool)} → {len(passed)} attrs"
+                        )
+
+                for ts in self.topic_states:
+                    if ts.history:
+                        await self._cluster_step(ts, step_idx=0, n_pop=cfg.evolution.initial_pop_size)
 
         # ── MAIN LOOP ────────────────────────────────────────────────────────
 
         n_steps_completed = 0
-        for step_idx in range(cfg.evolution.n_steps):
+        for step_idx in range(start_step, cfg.evolution.n_steps):
             logger.info(f"=== Step {step_idx}: EVALUATE ===")
             any_evaluated = False
             for ts in self.topic_states:
@@ -326,7 +344,7 @@ class BonAmplifiedEvolutionEngine:
         for ts in self.topic_states:
             self.tracker.log_per_prompt_r2_history(
                 topic_id=ts.topic_id,
-                history=self._per_prompt_r2_history.get(ts.topic_id, []),
+                history=self._estates[ts.topic_id].per_prompt_r2_history,
                 output_dir=cfg.run_output_dir(),
             )
 
@@ -362,9 +380,9 @@ class BonAmplifiedEvolutionEngine:
         cfg = self.config
         ba_cfg = cfg.bon_amplified
         step = ts.history[step_idx]
-        fixed_baselines = self._fixed_baselines[ts.topic_id]
-        detection_cache = self._detection_cache[ts.topic_id]
-        acc_pool = self._acc_pool[ts.topic_id]
+        fixed_baselines = self._estates[ts.topic_id].fixed_baselines
+        detection_cache = self._estates[ts.topic_id].detection_cache
+        acc_pool = self._estates[ts.topic_id].acc_pool
 
         attr_pool = list(step.attributes.keys())
         if not attr_pool:
@@ -397,6 +415,7 @@ class BonAmplifiedEvolutionEngine:
         amp_scores = _compute_amp_from_detection(
             detection_cache, fixed_baselines, attr_pool, reward_name,
             amp_mode="bon", bon_n=ba_cfg.N,
+            not_applicable_as_absent=cfg.models.detector.not_applicable_as_absent,
         )
 
         # [C] Prune: A_hat > tau, then top-K or select_all
@@ -406,7 +425,7 @@ class BonAmplifiedEvolutionEngine:
                 f"  [C] A(g)≤{ba_cfg.tau} filter: removing {len(amp_failed)} attrs: "
                 + ", ".join(sorted(amp_failed))
             )
-            _add_to_rejected(self._rejected_pool[ts.topic_id], amp_failed)
+            _add_to_rejected(self._estates[ts.topic_id].rejected_pool, amp_failed)
             attr_pool = [a for a in attr_pool if a not in amp_failed]
             _trim_step(step, attr_pool)
         if not attr_pool:
@@ -435,7 +454,7 @@ class BonAmplifiedEvolutionEngine:
                         f" → rejected: {attr[:60]}"
                     )
             if p1_failed:
-                _add_to_rejected(self._rejected_pool[ts.topic_id], p1_failed)
+                _add_to_rejected(self._estates[ts.topic_id].rejected_pool, p1_failed)
                 attr_pool = [a for a in attr_pool if a not in p1_failed]
                 _trim_step(step, attr_pool)
                 logger.info(f"  [C-p1] prevalence filter removed {len(p1_failed)} attrs")
@@ -463,7 +482,7 @@ class BonAmplifiedEvolutionEngine:
         acc_pool[:] = selected
 
         # Track first-seen step for each attr (for age display in pool snapshots)
-        first_seen = self._attr_first_seen[ts.topic_id]
+        first_seen = self._estates[ts.topic_id].attr_first_seen
         for attr in selected:
             if attr not in first_seen:
                 first_seen[attr] = step_idx
@@ -517,11 +536,11 @@ class BonAmplifiedEvolutionEngine:
             amp_scores=amp_scores,
             tau_rejected=list(amp_failed),
             tau=ba_cfg.tau,
-            first_seen=self._attr_first_seen[ts.topic_id],
+            first_seen=self._estates[ts.topic_id].attr_first_seen,
         )
 
         if ba_cfg.detection_cache_path:
-            _model_key = f"{cfg.models.detector.model}::{cfg.models.detector.image_detail}"
+            _model_key = detector_model_key(cfg.models.detector)
             self._save_detection_cache(
                 ts.topic_id, Path(ba_cfg.detection_cache_path), _model_key
             )
@@ -548,9 +567,9 @@ class BonAmplifiedEvolutionEngine:
             return
 
         ba_step = ts.ba_history[-1]
-        fixed_baselines = self._fixed_baselines[ts.topic_id]
-        detection_cache = self._detection_cache[ts.topic_id]
-        acc_pool = self._acc_pool[ts.topic_id]
+        fixed_baselines = self._estates[ts.topic_id].fixed_baselines
+        detection_cache = self._estates[ts.topic_id].detection_cache
+        acc_pool = self._estates[ts.topic_id].acc_pool
 
         if not acc_pool or not fixed_baselines:
             self._create_empty_next_step(ts, step_idx)
@@ -562,6 +581,7 @@ class BonAmplifiedEvolutionEngine:
             _compute_bon_residuals(
                 detection_cache, fixed_baselines, acc_pool,
                 reward_name, ba_cfg.N, mode=ols_mode,
+                not_applicable_as_absent=cfg.models.detector.not_applicable_as_absent,
             )
         )
         ba_step.residuals = {f"{k[0]}||{k[1]}": v for k, v in residuals.items()}
@@ -573,7 +593,7 @@ class BonAmplifiedEvolutionEngine:
         ba_step.per_prompt_W = per_prompt_W or {}
 
         # Append per-prompt R² to history (#8)
-        self._per_prompt_r2_history[ts.topic_id].append({
+        self._estates[ts.topic_id].per_prompt_r2_history.append({
             "step": step_idx, **per_prompt_r2,
         })
         logger.info(
@@ -641,9 +661,9 @@ class BonAmplifiedEvolutionEngine:
                 n_proposals=ba_cfg.n_proposals,
                 n_prompts_vlm=ba_cfg.n_prompts_vlm,
                 avoid_attrs=(
-                    self._rejected_pool[ts.topic_id]
+                    self._estates[ts.topic_id].rejected_pool
                     + ([] if ba_cfg.proposer_avoid_current_run_only
-                       else self._cached_rejected.get(ts.topic_id, []))
+                       else self._estates[ts.topic_id].cached_rejected)
                 ),
                 cluster_summary=ts.cluster_summary if ba_cfg.proposer_use_cluster_summary else None,
                 per_prompt_r2=per_prompt_r2,
@@ -668,7 +688,7 @@ class BonAmplifiedEvolutionEngine:
         if raw_candidates:
             passed_humanness = await self.attr_filter.filter_by_humanness(raw_candidates)
             humanness_failed = set(raw_candidates) - set(passed_humanness)
-            _add_to_rejected(self._rejected_pool[ts.topic_id], humanness_failed)
+            _add_to_rejected(self._estates[ts.topic_id].rejected_pool, humanness_failed)
             raw_candidates = passed_humanness
             logger.info(f"  [★] Humanness filter: {len(raw_candidates)} candidates pass")
 
@@ -689,6 +709,7 @@ class BonAmplifiedEvolutionEngine:
             cand_amp = _compute_amp_from_detection(
                 detection_cache, fixed_baselines, raw_candidates, reward_name,
                 amp_mode="bon", bon_n=ba_cfg.N,
+                not_applicable_as_absent=cfg.models.detector.not_applicable_as_absent,
             )
 
             if ba_cfg.use_monotonic_pool:
@@ -699,6 +720,7 @@ class BonAmplifiedEvolutionEngine:
                     residuals=residuals,
                     fixed_baselines=fixed_baselines,
                     N=ba_cfg.N,
+                    not_applicable_as_absent=cfg.models.detector.not_applicable_as_absent,
                 )
                 passing = [
                     c for c in raw_candidates
@@ -720,7 +742,7 @@ class BonAmplifiedEvolutionEngine:
                         "≤ tau_partial" if pa <= ba_cfg.tau_partial
                         else f"not in Top-{ba_cfg.n_admit_per_step}"
                     )
-                    _add_to_rejected(self._rejected_pool[ts.topic_id], {cand})
+                    _add_to_rejected(self._estates[ts.topic_id].rejected_pool, {cand})
                     logger.info(
                         f"  [D] Rejected  '{cand}'  partial_A_hat={pa:+.4f}  ({reason})"
                     )
@@ -734,13 +756,13 @@ class BonAmplifiedEvolutionEngine:
                         logger.info(f"  [D] Validated '{cand}'  A_hat={a_hat:.4f}")
                     else:
                         tau_rejected.append(cand)
-                        _add_to_rejected(self._rejected_pool[ts.topic_id], {cand})
+                        _add_to_rejected(self._estates[ts.topic_id].rejected_pool, {cand})
                         logger.info(
                             f"  [D] Rejected  '{cand}'  A_hat={a_hat:.4f} (≤ tau={ba_cfg.tau})"
                         )
 
             if ba_cfg.detection_cache_path:
-                _model_key = f"{cfg.models.detector.model}::{cfg.models.detector.image_detail}"
+                _model_key = detector_model_key(cfg.models.detector)
                 self._save_detection_cache(
                     ts.topic_id, Path(ba_cfg.detection_cache_path), _model_key
                 )
@@ -869,6 +891,111 @@ class BonAmplifiedEvolutionEngine:
         ts.history.append(EvoStep(step_idx=step_idx + 1))
         logger.debug(f"Topic {ts.topic_id}: empty EvoStep added for step {step_idx + 1}")
 
+    def _load_state_from_artifacts(self) -> int:
+        """Rebuild per-topic state (history, ba_history, acc_pool, surviving,
+        first_seen) from ba_expand_step{N}_topic{T}.json artifacts in
+        self.resume_from_dir. Returns the next step to run (= min last-completed
+        step across topics + 1), or 0 if no artifact is found for any topic.
+        """
+        from search.data.bon_amplified_types import BonAmplifiedStep
+
+        assert self.resume_from_dir is not None
+        run_dir = Path(self.resume_from_dir)
+        cfg = self.config
+
+        topic_last: dict[int, int] = {}
+        per_topic_artifacts: dict[int, list[tuple[int, dict]]] = {}
+        for ts in self.topic_states:
+            files = sorted(
+                run_dir.glob(f"ba_expand_step*_topic{ts.topic_id}.json"),
+                key=lambda p: int(p.stem.split("step")[1].split("_topic")[0]),
+            )
+            if not files:
+                logger.warning(
+                    f"Topic {ts.topic_id}: no ba_expand_step*_topic{ts.topic_id}.json "
+                    f"under {run_dir} — starting this topic from step 0"
+                )
+                return 0
+            arts: list[tuple[int, dict]] = []
+            for f in files:
+                step_idx = int(f.stem.split("step")[1].split("_topic")[0])
+                arts.append((step_idx, json.loads(f.read_text())))
+            per_topic_artifacts[ts.topic_id] = arts
+            topic_last[ts.topic_id] = arts[-1][0]
+
+        # Use the min last-completed step across topics so every topic resumes
+        # from a step that exists for all of them. (Topics usually march in lockstep
+        # in this pipeline, but be defensive.)
+        last_common = min(topic_last.values())
+
+        # Replay state into per-topic history / ba_history / surviving + engine
+        # state (acc_pool, first_seen). Heavy fields like `detection` and
+        # `residuals` are NOT reconstructed — they're only needed within the
+        # step that produced them. The detection cache itself is loaded
+        # separately from disk and contains everything we need going forward.
+        for ts in self.topic_states:
+            arts = per_topic_artifacts[ts.topic_id]
+            # Trim to the common last step so all topics are in sync.
+            arts = [(s, j) for s, j in arts if s <= last_common]
+
+            for s, j in arts:
+                # Pad ts.history with empty EvoStep placeholders for indices 0..s
+                while len(ts.history) <= s:
+                    ts.history.append(EvoStep(step_idx=len(ts.history)))
+
+                # BonAmplifiedStep — populate just the fields the artifact has.
+                ts.ba_history.append(BonAmplifiedStep(
+                    step_idx=s,
+                    N=cfg.bon_amplified.N,
+                    attribute_pool=list(j.get("acc_pool", [])),
+                    acc_pool_snapshot=list(j.get("acc_pool", [])),
+                    detection={},  # heavy, intentionally not restored
+                    amp_scores=j.get("candidate_partial_ahat")
+                                or j.get("candidate_ahat") or {},
+                    W=list(j.get("W", []) or []),
+                    W_mode=j.get("W_mode", "mean_per_prompt"),
+                    reg_var_explained=float(j.get("reg_var_explained", 0.0) or 0.0),
+                    n_images=int(j.get("n_residual_images", 0) or 0),
+                    per_prompt_r2=j.get("per_prompt_r2", {}) or {},
+                ))
+
+                # Track first-seen step per attribute, mirroring the live flow.
+                for attr in j.get("acc_pool", []):
+                    self._estates[ts.topic_id].attr_first_seen.setdefault(attr, s)
+                    ts.surviving.setdefault(attr, s)
+
+            # Engine-level acc_pool is whatever the last replayed step left it as.
+            last_artifact = arts[-1][1]
+            self._estates[ts.topic_id].acc_pool = list(last_artifact.get("acc_pool", []))
+
+            # Append the EvoStep that the original _expand_step(last_common)
+            # would have created at its end: history[last_common + 1] populated
+            # with acc_pool attrs as AttributeStats (operation="survived"), so
+            # EVALUATE at start_step has the right attribute_pool to score.
+            next_step = EvoStep(step_idx=last_common + 1)
+            for attr in self._estates[ts.topic_id].acc_pool:
+                next_step.attributes[attr] = AttributeStats(
+                    attribute=attr,
+                    meta=AttributeMeta(
+                        time_step=last_common + 1,
+                        parent=None,
+                        parent_time_step=None,
+                        operation="survived",
+                        planner_model=cfg.models.planner.model,
+                        reasoning_effort=cfg.models.planner.reasoning,
+                    ),
+                )
+            ts.history.append(next_step)
+
+            logger.info(
+                f"Topic {ts.topic_id}: resumed up to step {last_common} → "
+                f"acc_pool={len(self._estates[ts.topic_id].acc_pool)} attrs, "
+                f"ba_history={len(ts.ba_history)} steps, "
+                f"next EvoStep prepared with {len(next_step.attributes)} attrs"
+            )
+
+        return last_common + 1
+
     def _load_detection_cache(self, topic_id: int, path: Path, model_key: str) -> None:
         if not path.exists():
             logger.info(f"Detection cache not found at {path}, starting fresh")
@@ -882,11 +1009,11 @@ class BonAmplifiedEvolutionEngine:
         saved = all_saved.get(model_key, {})
         fixed_image_ids = {
             img.image_id
-            for imgs in self._fixed_baselines[topic_id].values()
+            for imgs in self._estates[topic_id].fixed_baselines.values()
             for img in imgs
         }
         n_loaded = 0
-        cache = self._detection_cache[topic_id]
+        cache = self._estates[topic_id].detection_cache
         for image_id, attr_vals in saved.items():
             if image_id not in fixed_image_ids:
                 continue
@@ -898,7 +1025,7 @@ class BonAmplifiedEvolutionEngine:
         )
         rejected_key = f"_rejected::{model_key}::{topic_id}"
         saved_rejected: list[str] = all_saved.get(rejected_key, [])
-        cached = self._cached_rejected.setdefault(topic_id, [])
+        cached = self._estates[topic_id].cached_rejected
         existing_rejected = set(cached)
         added = 0
         for attr in saved_rejected:
@@ -910,7 +1037,7 @@ class BonAmplifiedEvolutionEngine:
             logger.info(f"Topic {topic_id}: loaded {added} rejected attrs from cache")
 
     def _save_detection_cache(self, topic_id: int, path: Path, model_key: str) -> None:
-        cache = self._detection_cache[topic_id]
+        cache = self._estates[topic_id].detection_cache
         if not cache:
             return
         all_existing: dict = {}
@@ -925,8 +1052,8 @@ class BonAmplifiedEvolutionEngine:
             model_cache.setdefault(image_id, {}).update(attr_vals)
         rejected_key = f"_rejected::{model_key}::{topic_id}"
         existing_rejected = set(all_existing.get(rejected_key, []))
-        existing_rejected.update(self._rejected_pool[topic_id])
-        existing_rejected.update(self._cached_rejected.get(topic_id, []))
+        existing_rejected.update(self._estates[topic_id].rejected_pool)
+        existing_rejected.update(self._estates[topic_id].cached_rejected)
         all_existing[rejected_key] = sorted(existing_rejected)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
@@ -987,6 +1114,7 @@ def _compute_bon_residuals(
     reward_model_name: str,
     N: int,
     mode: str = "global",
+    not_applicable_as_absent: bool = False,
 ) -> "tuple[dict[tuple[str, str], float], list[float], float, float, float, dict[str, float], dict[str, list[float]] | None]":
     """Within-prompt centered OLS of U^{N-1} on g matrix.
 
@@ -1017,7 +1145,7 @@ def _compute_bon_residuals(
     if not acc_pool:
         return _empty
 
-    # ── Collect per-prompt centered (G_x_c, U_pow_c) ──────────────────────────
+    # ── Collect per-prompt centered (G_x_centered, U_pow_centered) ──────────
     per_prompt_data: dict[str, tuple[np.ndarray, np.ndarray, list[str]]] = {}
     all_keys: list[tuple[str, str]] = []
 
@@ -1044,6 +1172,9 @@ def _compute_bon_residuals(
             [[float(detection_cache[img.image_id].get(attr, 0)) for attr in acc_pool]
              for img in scored]
         )
+        if not_applicable_as_absent:
+            # Cache stores -1 for "not applicable"; treat as absent (=0) in OLS.
+            G_x = np.where(G_x == -1, 0, G_x)
 
         G_x_c = G_x - G_x.mean(axis=0, keepdims=True)
         U_pow_c = U_pow - U_pow.mean()
@@ -1062,7 +1193,7 @@ def _compute_bon_residuals(
 
     for prompt_text, (G_x_c, U_x_c, _ids) in per_prompt_data.items():
         var_u_x = float(np.var(U_x_c))
-        if var_u_x < 1e-10 or G_x_c.shape[0] < G_x_c.shape[1]:
+        if var_u_x < OLS_VARIANCE_EPSILON or G_x_c.shape[0] < G_x_c.shape[1]:
             W_x = np.zeros(K)
             res_x = U_x_c.copy()
             r2_x = 0.0
@@ -1112,7 +1243,7 @@ def _compute_bon_residuals(
         residuals_dict = {key: float(r) for key, r in zip(all_keys, residuals_vec)}
         var_u = float(np.var(u_all))
         var_exp = (max(0.0, 1.0 - float(np.var(residuals_vec)) / var_u)
-                   if var_u > 1e-10 else 0.0)
+                   if var_u > OLS_VARIANCE_EPSILON else 0.0)
         W_out = W_vec.tolist()
         per_prompt_W_out = None
 
@@ -1128,6 +1259,7 @@ def _compute_partial_a_hat(
     residuals: "dict[tuple[str, str], float]",
     fixed_baselines: "dict[str, list[BaselineImage]]",
     N: int,
+    not_applicable_as_absent: bool = False,
 ) -> dict[str, float]:
     """For each candidate g*, compute partial_A_hat = N × E_x[Cov_x(g*, residuals)].
 
@@ -1149,6 +1281,9 @@ def _compute_partial_a_hat(
             g_x = np.array(
                 [float(detection_cache[img.image_id][g_star]) for img in valid]
             )
+            if not_applicable_as_absent:
+                # Cache stores -1 for "not applicable"; treat as absent (=0).
+                g_x = np.where(g_x == -1, 0, g_x)
             e_x = np.array(
                 [residuals[(prompt_text, img.image_id)] for img in valid]
             )

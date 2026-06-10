@@ -7,7 +7,6 @@ from search.data.types import Prompt, BaselineImage, CounterfactualPair
 from search.utils.stats import remove_outliers as remove_outliers_fn
 
 if TYPE_CHECKING:
-    from search.data.baseline_pair_types import BaselinePairStep
     from search.data.bon_amplified_types import BonAmplifiedStep
 
 
@@ -108,8 +107,6 @@ class TopicState:
     history: list[EvoStep] = field(default_factory=list)
     surviving: dict[str, int] = field(default_factory=dict)
     # attr_text -> step_idx where it was first found
-    bp_history: list["BaselinePairStep"] = field(default_factory=list)
-    # baseline-pairs mode: per-step data (detection, pairs, Lasso results)
     ba_history: list["BonAmplifiedStep"] = field(default_factory=list)
     # bon-amplified mode: per-step data (detection, residuals, amp scores)
 
@@ -148,3 +145,25 @@ class TopicState:
             if stats is not None:
                 return stats
         return None
+
+
+@dataclass
+class TopicEngineState:
+    """Live engine state for one topic — refreshed by SETUP, mutated each step.
+
+    Replaces the seven per-topic dicts that used to live on
+    ``BonAmplifiedEvolutionEngine`` and removes the chore of remembering to
+    initialise / repopulate each one on every code path (fresh run, resume,
+    initial-pool load).
+    """
+    fixed_baselines: dict[str, list[BaselineImage]] = field(default_factory=dict)
+    detection_cache: dict[str, dict[str, int]] = field(default_factory=dict)
+    acc_pool: list[str] = field(default_factory=list)
+    # Attrs rejected in the CURRENT run (humanness or A_hat failures).
+    rejected_pool: list[str] = field(default_factory=list)
+    # Attrs the on-disk detection cache marked as rejected in earlier runs.
+    cached_rejected: list[str] = field(default_factory=list)
+    # attr → step_idx where it first entered acc_pool.
+    attr_first_seen: dict[str, int] = field(default_factory=dict)
+    # Per-step snapshots of {prompt → R²}, appended after each EXPAND.
+    per_prompt_r2_history: list[dict] = field(default_factory=list)
