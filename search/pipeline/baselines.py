@@ -15,6 +15,7 @@ def load_topic_states(
     topic_ids: list[int],
     val_split_size: int = 40,
     random_seed: int = 42,
+    summary_field: str = "summary",
 ) -> list[TopicState]:
     """Load cluster JSON files and build TopicState objects (without baselines)."""
     from random import Random
@@ -40,11 +41,11 @@ def load_topic_states(
         states.append(TopicState(
             topic_id=topic_id,
             prompts=prompts,
-            cluster_summary=data.get("summary", ""),
+            cluster_summary=data.get(summary_field, ""),
         ))
         logger.info(
             f"Topic {topic_id}: {len(train_texts)} train / {len(val_texts)} val prompts\n"
-            f"  Summary: {data.get('summary', '')[:80]}"
+            f"  Summary: {data.get(summary_field, '')[:80]}"
         )
 
     return states
@@ -101,6 +102,7 @@ def load_val_topic_state(
     topic_id: int,
     val_split_size: int = 40,
     random_seed: int = 42,
+    summary_field: str = "summary",
 ) -> TopicState:
     """Load val split for a single topic using the same shuffle as load_topic_states()."""
     from random import Random
@@ -123,11 +125,11 @@ def load_val_topic_state(
     state = TopicState(
         topic_id=topic_id,
         prompts=prompts,
-        cluster_summary=data.get("summary", ""),
+        cluster_summary=data.get(summary_field, ""),
     )
     logger.info(
         f"Topic {topic_id}: loaded {len(val_texts)} val prompts\n"
-        f"  Summary: {data.get('summary', '')[:80]}"
+        f"  Summary: {data.get(summary_field, '')[:80]}"
     )
     return state
 

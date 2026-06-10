@@ -31,8 +31,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--manifest_path", required=True,
                    help="Path to manifest.json to score")
     p.add_argument("--reward_model", default="imagereward",
-                   choices=["imagereward", "pickscore", "hpsv3"],
+                   choices=["imagereward", "pickscore", "hpsv3", "vqascore"],
                    help="Reward model to use (default: imagereward)")
+    p.add_argument("--vqa_model", default="clip-flant5-xxl",
+                   help="VQAScore backbone (only used when --reward_model vqascore); "
+                        "e.g. clip-flant5-xxl, qwen2.5-vl-7b, gemma-3-27b-it, gpt-4o")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--hf_cache_dir", default="/nfs/data/sohyun/models")
     p.add_argument("--batch_size", type=int, default=32,
@@ -42,7 +45,8 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def load_reward_model(name: str, device: str, hf_cache_dir: str):
+def load_reward_model(name: str, device: str, hf_cache_dir: str,
+                      vqa_model: str = "clip-flant5-xxl"):
     sys.path.insert(0, str(Path(__file__).parent.parent))
     if name == "imagereward":
         from search.models.reward.imagereward import ImageRewardModel
@@ -53,6 +57,9 @@ def load_reward_model(name: str, device: str, hf_cache_dir: str):
     elif name == "hpsv3":
         from search.models.reward.hpsv3 import HPSv3Model
         return HPSv3Model(device=device, hf_cache_dir=hf_cache_dir)
+    elif name == "vqascore":
+        from search.models.reward.vqascore import VQAScoreModel
+        return VQAScoreModel(device=device, hf_cache_dir=hf_cache_dir, vqa_model=vqa_model)
     else:
         sys.exit(f"Unknown reward model: {name}")
 
@@ -174,6 +181,9 @@ def main() -> None:
         manifest = json.load(f)
     baselines = manifest.get("baselines", {})
     reward_name = args.reward_model
+    if args.reward_model == "vqascore":
+        # Include the backbone so multiple VQAScore models coexist (don't clobber).
+        reward_name = f"vqascore_{args.vqa_model}"
 
     to_score: list[tuple[str, dict]] = []     # (prompt, entry)
     for prompt, entries in baselines.items():
@@ -186,7 +196,8 @@ def main() -> None:
         return
 
     print(f"Loading {reward_name} model on {args.device} ...")
-    model = load_reward_model(reward_name, args.device, args.hf_cache_dir)
+    model = load_reward_model(args.reward_model, args.device, args.hf_cache_dir,
+                              vqa_model=args.vqa_model)
 
     total = len(to_score)
     print(f"Scoring {total} images ...")

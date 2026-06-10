@@ -125,6 +125,7 @@ class EvolutionEngine:
             order=config.evolution.image_order,
             random_seed=config.run.random_seed,
             score_normalization=config.evolution.initial_score_normalization,
+            output_dir=config.run_output_dir() / "planner",
         )
 
         mutator = AttributeMutator(
@@ -154,6 +155,7 @@ class EvolutionEngine:
             topic_ids=config.data.topic_ids,
             val_split_size=config.data.val_split_size,
             random_seed=config.run.random_seed,
+            summary_field=config.data.cluster_summary_field,
         )
 
         return cls(
@@ -473,4 +475,3 @@ class EvolutionEngine:
                 # score_diff: +1.0 = edited (A) wins, -1.0 = baseline (B) wins
                 # delta_j < 0 means judge prefers baseline (undesirable attribute criterion)
                 pairs[pidx].delta_j = result.score_diff
-        import pdb; pdb.set_trace()

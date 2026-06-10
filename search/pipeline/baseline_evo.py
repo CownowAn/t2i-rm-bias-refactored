@@ -181,6 +181,7 @@ class BaselinePairEvolutionEngine:
             random_seed=config.run.random_seed,
             require_editable=False,  # baseline-pairs: VLM detection, not FLUX editing
             score_normalization=config.evolution.initial_score_normalization,
+            output_dir=config.run_output_dir() / "planner",
             cache_config=cache_config,
         )
         clusterer = AttributeClusterer(
@@ -194,6 +195,7 @@ class BaselinePairEvolutionEngine:
             topic_ids=config.data.topic_ids,
             val_split_size=config.data.val_split_size,
             random_seed=config.run.random_seed,
+            summary_field=config.data.cluster_summary_field,
         )
         return cls(
             config=config, topic_states=topic_states,

@@ -22,6 +22,7 @@ MODEL_ID="stabilityai/stable-diffusion-3.5-medium"
 # OUTPUT_DIR="/nfs/data/sohyun/baselines/mjhq"
 OUTPUT_DIR="/nfs/data/sohyun/projects/t2i-rm-bias/data/baselines/mjhq"
 REWARD_MODEL="imagereward"
+VQA_MODEL="clip-flant5-xxl"   # VQAScore backbone (only used when --reward_model vqascore)
 HF_CACHE_DIR="/nfs/data/sohyun/models"
 BATCH_SIZE=32
 
@@ -41,6 +42,7 @@ while [[ $# -gt 0 ]]; do
         --model_id)     MODEL_ID="$2";      shift 2 ;;
         --output_dir)   OUTPUT_DIR="$2";    shift 2 ;;
         --reward_model) REWARD_MODEL="$2";  shift 2 ;;
+        --vqa_model)    VQA_MODEL="$2";     shift 2 ;;
         --hf_cache_dir) HF_CACHE_DIR="$2";  shift 2 ;;
         --batch_size)   BATCH_SIZE="$2";    shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -57,6 +59,7 @@ if [[ -n "$MANIFEST" ]]; then
     python baselines/score_baselines.py \
         --manifest_path "$MANIFEST" \
         --reward_model "$REWARD_MODEL" \
+        --vqa_model "$VQA_MODEL" \
         --device cuda:0 \
         --hf_cache_dir "$HF_CACHE_DIR" \
         --batch_size "$BATCH_SIZE"
@@ -76,6 +79,7 @@ else
         python baselines/score_baselines.py \
             --manifest_path "$MANIFEST_PATH" \
             --reward_model "$REWARD_MODEL" \
+            --vqa_model "$VQA_MODEL" \
             --device cuda:0 \
             --hf_cache_dir "$HF_CACHE_DIR" \
             --batch_size "$BATCH_SIZE"

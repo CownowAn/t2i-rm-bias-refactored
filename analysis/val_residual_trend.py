@@ -197,6 +197,7 @@ def _run_for_topic(
         topic_id=topic_id,
         val_split_size=int(data_cfg.get("val_split_size", 40)),
         random_seed=int(cfg["run"]["random_seed"]),
+        summary_field=data_cfg.get("cluster_summary_field", "summary"),
     )
     load_baselines_from_manifest(
         topic_state=val_state,

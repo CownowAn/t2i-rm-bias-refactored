@@ -14,3 +14,6 @@ tqdm
 pillow
 safetensors
 huggingface-hub>=0.24.0
+
+# VQAScore (image-text alignment) backbones — used by --reward_model vqascore
+t2v-metrics

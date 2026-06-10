@@ -38,7 +38,7 @@ class AttributeStats:
     pairs: dict[str, list[CounterfactualPair]] = field(default_factory=dict)
     # prompt_text -> list of CounterfactualPairs (one per rollout)
     baseline_detected: dict[str, int] = field(default_factory=dict)
-    # image_id -> 0/1 VLM detection result, populated by AmplificationScorer
+    # image_id -> VLM detection result, populated by AmplificationScorer
 
     def _all_delta_rm(self) -> list[float]:
         scores = []

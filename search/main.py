@@ -32,12 +32,15 @@ async def main() -> None:
     # Configure loguru
     logger.remove()
     logger.add(sys.stderr, level=config.logging.console_level)
-    log_path = Path(config.run_output_dir()) / "run.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    logger.add(str(log_path), level="DEBUG", rotation="50 MB")
+    logs_dir = Path(config.run_output_dir()) / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    info_log_path = logs_dir / "run.info.log"
+    logger.add(str(info_log_path), level="INFO", rotation="50 MB")
+    debug_log_path = logs_dir / "run.debug.log"
+    logger.add(str(debug_log_path), level="DEBUG", rotation="50 MB")
 
     # Save the original config yaml and the effective config (with CLI overrides applied)
-    configs_dir = log_path.parent / "configs"
+    configs_dir = Path(config.run_output_dir()) / "configs"
     configs_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy(args.config, configs_dir / "config_source.yaml")
     effective_config_path = configs_dir / "config_effective.yaml"
@@ -46,7 +49,6 @@ async def main() -> None:
 
     logger.info(f"Run: {config.run.name}")
     logger.info(f"Output dir: {config.run_output_dir()}")
-    logger.info(f"n_steps={config.evolution.n_steps}, direction={config.evolution.direction}")
 
     from search.utils.cost import log_cost_estimate
     log_cost_estimate(config)

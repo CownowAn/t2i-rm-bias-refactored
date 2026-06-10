@@ -10,10 +10,14 @@ bon_amplified:
   N: 2                       # BoN parameter for U^{N-1} quantile
   tau: 0.0                    # A_hat pruning threshold (keep attrs with A_hat > tau)
   n_top_residual: 4           # P+/P- images extracted per prompt
+  # P+/P- selection within sign-split pools: "extreme"(default) | "reward_matched" | "random"
+  pplus_pminus_selection: "random"
+  pplus_pminus_reward_tol: null   # max |reward diff| for reward_matched (null = no cap)
   n_prompts_vlm: 8            # prompts shown to VLM per mining call
   n_proposals: 10             # attr proposals requested per VLM mining call
   n_proposer_calls: 2         # proposer VLM calls per EXPAND step (total = n_proposals × n_proposer_calls)
   proposer_use_cluster_summary: true  # include cluster summary in proposer prompt
+  proposer_avoid_current_run_only: true  # proposer avoid uses only current-run rejected (excludes cached)
   use_per_prompt_ols: true   # fit separate OLS W_x per prompt (residuals = per-prompt unexplained)
   # Monotonic pool + partial_A_hat admission
   use_monotonic_pool: true   # admit via partial_A_hat (> tau_partial, Top-K'); skip top-K cap
@@ -29,23 +33,25 @@ bon_amplified:
   p1_min: 0.1
   p1_max: 0.9
   # detection_cache_path: outputs/detection_cache/diffusiondb/2m_random_1k/train/black-forest-labs/FLUX.1-dev.json
-  detection_cache_path: outputs/detection_cache/mjhq/black-forest-labs-FLUX.1-dev.json
+  detection_cache_path: outputs/detection_cache/mjhq/black-forest-labs-FLUX.1-dev_applicability.json
+  # Start step 0 from a saved pool (a JSON file or a run's planner/ dir); when set,
+  # planner + humanness + clustering are skipped. Uncomment to enable.
+  initial_pool_path: outputs/search/20260609-001716/planner
 
 
 data:
-  # baseline_manifest: "/home/sohyun0423/project/reward-model-bias/data/baselines/diffusiondb/2m_random_1k/train/topic_0/black-forest-labs/FLUX.1-dev/manifest.json"
-  # baseline_root: "/home/sohyun0423/project/reward-model-bias"
-  # prompts_dir: "/home/sohyun0423/project/reward-model-bias/user_prompts/diffusiondb/2m_random_1k/train"
-  baseline_manifest: "/nfs/data/sohyun/projects/t2i-rm-bias/data/baselines/mjhq/topic_0/black-forest-labs-FLUX.1-dev/manifest.json"
+  # baseline_manifest: "/nfs/data/sohyun/projects/t2i-rm-bias/data/baselines/mjhq/topic_0/black-forest-labs-FLUX.1-dev/manifest.json"
+  baseline_manifest: "/nfs/data/sohyun/projects/t2i-rm-bias/data/baselines/mjhq_10tok/100prompt/topic_0/sd2-community-stable-diffusion-2-1/manifest.json"
   baseline_root: ""
-  prompts_dir: "clustering/output/mjhq"
+  # prompts_dir: "clustering/output/mjhq"
+  prompts_dir: "clustering/output/mjhq_10tok/100prompt"
   topic_ids: [0]
-  # val_split_size: 40
-  val_split_size: 100
+  val_split_size: 50
+  cluster_summary_field: "category"
 
 models:
   reward_model:
-    name: "imagereward"  # "imagereward" | "pickscore" | "hpsv3"
+    name: "pickscore"  # "imagereward" | "pickscore" | "hpsv3"
     device: "cuda:0"
     hf_cache_dir: "/nfs/data/sohyun/models"
 
@@ -66,6 +72,8 @@ models:
         enable_thinking: false
     use_prompt: false      # include image generation prompt in detection query
     use_reasoning: false   # request reasoning field in JSON response (false = faster)
+    use_applicability: true  # also report whether the attribute applies to the image (applicable=false → -1)
+    not_applicable_as_absent: true  # collapse -1 (not applicable) to 0 (absent) when stored
 
   planner:
     model: "openai/gpt-5.2"
@@ -107,15 +115,15 @@ models:
     use_batch_api: false
 
 evolution:
-  n_steps: 20
+  n_steps: 15
   initial_pop_size: 4           # clustering cap = initial_pop_size × 2
-  target_pop_sizes: [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4]   # K for top-K selection per step
+  target_pop_sizes: [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4]   # K for top-K selection per step
   n_context_imgs: 8            # images shown to InitialPlanner per prompt
   n_attrs_per_prompt: 8         # attrs requested per InitialPlanner call
   n_per_user_prompt: 1          # InitialPlanner calls per train prompt (single-prompt mode only)
   n_initial_plan_prompts: 32    # train prompts sampled for InitialPlanner
   n_prompts_per_plan_call: 4    # >1: show multiple prompts per VLM call (cross-prompt mode)
-  initial_context_sampling: "stratified"
+  initial_context_sampling: "random"
   use_cluster_summary: true
   direction: "plus"
   image_order: "descending"
@@ -124,13 +132,13 @@ evolution:
   #   "zscore"   → within-prompt z-score
   #   "minmax"   → within-prompt min-max scaled [0, 1]
   #   "quantile" → within-prompt rank percentile (matches U used by BoN OLS)
-  initial_score_normalization: "none"
+  initial_score_normalization: "quantile"
 
 evaluation:
   # train_batch_size: [32, 32, 32, 32, 32, 32, 32, 32, 32, 32]   # required by validate()
   # amp_n_prompts: 32             # prompts sampled for fixed baseline set
-  train_batch_size: [100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100]   # required by validate()
-  amp_n_prompts: 100             # prompts sampled for fixed baseline set
+  train_batch_size: [50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50]   # required by validate()
+  amp_n_prompts: 50             # prompts sampled for fixed baseline set
   amp_n_images_per_prompt: 128  # images per prompt in fixed baseline set
 
 # baseline_pairs section is unused by bon_amplified; required by SearchConfig.validate()

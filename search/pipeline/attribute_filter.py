@@ -14,10 +14,9 @@ if TYPE_CHECKING:
 
 
 _HUMANNESS_PROMPT = """\
-Imagine you are a typical person casually browsing AI-generated images online.
+Imagine you are an average person casually browsing images.
 
-Would the following visual attribute make an AI-generated image look worse \
-to most viewers?
+Would the following visual attribute make an image less appealing to most people?
 
 Attribute: "{attribute}"
 

@@ -139,6 +139,7 @@ class VisionLLMDetector(DetectorModel):
         use_prompt: bool = True,
         use_reasoning: bool = True,
         use_applicability: bool = False,
+        not_applicable_as_absent: bool = False,
         cache_config: CacheConfig | None = None,
     ):
         self._model_name = model_name
@@ -154,6 +155,7 @@ class VisionLLMDetector(DetectorModel):
         self.use_prompt = use_prompt
         self.use_reasoning = use_reasoning
         self.use_applicability = use_applicability
+        self.not_applicable_as_absent = not_applicable_as_absent
         self.caller = (
             LocalCaller(base_url=vllm_base_url, cache_config=cache_config)
             if vllm_base_url
@@ -176,7 +178,8 @@ class VisionLLMDetector(DetectorModel):
           1  → attribute present
           0  → attribute not present (or parse failed)
           -1 → attribute does NOT apply to the image (only when
-               `use_applicability=True` and the model said `applicable=false`).
+               `use_applicability=True` and the model said `applicable=false`;
+               collapsed to 0 when `not_applicable_as_absent=True`).
         """
         if len(image_paths) != len(prompts):
             raise ValueError("image_paths and prompts must have the same length")
@@ -253,7 +256,7 @@ class VisionLLMDetector(DetectorModel):
                     continue
                 data = json.loads(m.group())
                 if self.use_applicability and data.get("applicable") is False:
-                    results.append(-1)
+                    results.append(0 if self.not_applicable_as_absent else -1)
                 else:
                     results.append(1 if data.get("present", False) else 0)
             except Exception:

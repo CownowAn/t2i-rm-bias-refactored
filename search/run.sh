@@ -19,6 +19,8 @@ mkdir -p "$TMPDIR"
 # ── BoN-Amplified mode (image-level U^{N-1} residuals, no FLUX needed) ──
 # python -m search.main --config search/configs/bon_amplified.yaml "${@:2}"
 # python -m search.main --config search/configs/bon_amplified.yaml
+# ── DEBUG: quick full-flow check (uncomment below, comment the partial line) ──
+# python -m search.main --config search/configs/bon_amplified_debug.yaml "${@:2}"
 python -m search.main --config search/configs/bon_amplified_partial.yaml "${@:2}"
 
 

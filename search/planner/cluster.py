@@ -125,12 +125,21 @@ class AttributeClusterer:
         *,
         cluster_summary: str,
         n_pop: int,
-    ) -> list[str]:
-        """Cluster a list of attributes and return up to n_pop representatives."""
+        return_clusters: bool = False,
+    ) -> "list[str] | tuple[list[str], list | None, str | None]":
+        """Cluster a list of attributes and return up to n_pop representatives.
+
+        When return_clusters=True, returns (reps, clusters, reasoning) where
+        `clusters` is the full size-sorted list of {representative, members}
+        dicts (or None on fallback) and `reasoning` is the clusterer's reasoning.
+        """
+        def _ret(reps, clusters=None, reasoning=None):
+            return (reps, clusters, reasoning) if return_clusters else reps
+
         if not attributes:
-            return []
+            return _ret([])
         if len(attributes) <= n_pop:
-            return attributes
+            return _ret(attributes)
 
         prompt = _CLUSTER_PROMPT.format(
             # cluster_summary=cluster_summary,
@@ -149,14 +158,14 @@ class AttributeClusterer:
 
         if not responses or responses[0] is None:
             logger.warning("Cluster LLM returned None; returning first n_pop attributes")
-            return attributes[:n_pop]
+            return _ret(attributes[:n_pop])
 
         cluster_results, reasoning = parse_json_response(responses[0])
         logger.info(f"Clustering reasoning:\n{reasoning}")
 
         if not isinstance(cluster_results, list):
             logger.warning("Cluster result not a list; returning first n_pop")
-            return attributes[:n_pop]
+            return _ret(attributes[:n_pop], reasoning=reasoning)
 
         # Unwrap extra nesting: [[{...}]] → [{...}]
         if cluster_results and isinstance(cluster_results[0], list):
@@ -166,7 +175,7 @@ class AttributeClusterer:
         cluster_results = [c for c in cluster_results if isinstance(c, dict)]
         if not cluster_results:
             logger.warning("Cluster result contained no dict entries; returning first n_pop")
-            return attributes[:n_pop]
+            return _ret(attributes[:n_pop], reasoning=reasoning)
 
         # Sort by cluster size, take top n_pop
         cluster_results.sort(key=lambda x: len(x.get("members", [])), reverse=True)
@@ -185,7 +194,7 @@ class AttributeClusterer:
         logger.info(f"Clustered {len(attributes)} → {len(reps)} attributes")
         for rep in reps:
             logger.info(f"  - {rep}")
-        return [r for r in reps if r]
+        return _ret([r for r in reps if r], cluster_results, reasoning)
 
     def to_dict(self) -> dict[str, Any]:
         return {"model_name": self.model_name, "reasoning": self.reasoning}

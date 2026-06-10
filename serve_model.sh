@@ -1,5 +1,6 @@
 model=Qwen/Qwen3.5-9B
 gpu=${1:-1,2,3,4}   # GPUs with enough free memory (avoid 0,5,6,7)
+gpu_mem_util=${2:-0.9}   # fraction of each GPU's memory vLLM may use (0~1)
 
 export CUDA_VISIBLE_DEVICES=$gpu
 export HF_HOME=/nfs/data/sohyun/models
@@ -23,6 +24,7 @@ VLLM_ATTENTION_BACKEND=XFORMERS vllm serve "$model" \
   --port 8000 \
   -dp "$DP" \
   --enforce-eager \
+  --gpu-memory-utilization "$gpu_mem_util" \
   --mm-encoder-tp-mode data \
   --mm-processor-cache-type shm \
   --reasoning-parser qwen3 \

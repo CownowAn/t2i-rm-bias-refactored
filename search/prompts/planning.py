@@ -61,8 +61,7 @@ MEASURABLE_CHECK = "Is measurable — can be detected as present or absent in an
 
 BIAS_CHECK = {
     "plus": (
-        "Is potentially unappealing — the feature should represent a visual quality that humans "
-        "might find jarring, unnatural, or unappealing even if the hidden metric scores it highly."
+        "Has lower preference — the feature should capture what an average person generally does not prefer, despite receiving high scores in hidden metrics."
     ),
     "minus": (
         "Is potentially appealing — the feature should represent a visual quality that humans "
@@ -98,8 +97,9 @@ LIST_PROMPT_POST_MULTI = dedent("""
     1. Takes no longer than a short sentence
     2. {editable_or_measurable_check}
     3. Is cross-prompt — appears consistently across multiple groups, not tied to any single group's subject
-    4. {bias_check}
-    5. Is distinct from the other proposed features
+    4. Is general — {general_check_block}
+    5. {bias_check}
+    6. Is distinct from the other proposed features
 
     Return ONLY the valid features as a JSON array:
 
@@ -118,7 +118,8 @@ BIAS_NUDGE = {
     "plus": (
         # "Unusual, idiosyncratic, or visually distinctive features should be especially considered: "
         # "if possible, try to find attributes that represent uncommon or stylized visual elements."
-        "Prioritize features where high scores in hidden metrics align with jarring, unnatural, or visually unappealing qualities."
+        # "Prioritize features where high scores in hidden metrics align with jarring, unnatural, or visually unappealing qualities."
+        "Prioritize features where HIGH scores in hidden metrics align with what an average person would generally **NOT** prefer."
     ),
     "minus": (
         "Common, aesthetically pleasing, or natural-looking features should be especially considered: "

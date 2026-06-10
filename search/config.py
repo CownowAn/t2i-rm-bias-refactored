@@ -27,6 +27,7 @@ class DataConfig:
     prompts_dir: str = ""
     topic_ids: list[int] = field(default_factory=lambda: [0])
     val_split_size: int = 40
+    cluster_summary_field: str = "summary"  # cluster JSON key used as cluster_summary ("summary" | "category")
 
 
 @dataclass
@@ -78,6 +79,9 @@ class DetectorConfig:
     # When True, the model is also asked whether the attribute even applies to the image
     # (e.g. "rocks are too smooth" on a portrait with no rocks → applicable=false → -1).
     use_applicability: bool = False
+    # When use_applicability=True, collapse the "not applicable" verdict (-1) to absent (0)
+    # so detection stays binary 0/1 in the cache and downstream. No effect if use_applicability=False.
+    not_applicable_as_absent: bool = False
 
 
 @dataclass
@@ -197,6 +201,12 @@ class BonAmplifiedConfig:
     N: int = 16                         # BoN parameter for U^{N-1} quantile
     tau: float = 0.0                    # A_hat pruning threshold (keep attrs with A_hat > tau)
     n_top_residual: int = 2             # P+/P- images extracted per prompt
+    # P+/P- selection within the sign-split pools (P+ residual>0, P- residual<0):
+    #   "extreme"        — most-positive / most-negative residual (current)
+    #   "reward_matched" — greedy match so the two groups have similar reward
+    #   "random"         — random n_top from each pool
+    pplus_pminus_selection: str = "extreme"
+    pplus_pminus_reward_tol: float | None = None   # max |reward diff| for reward_matched (None = no cap)
     n_prompts_vlm: int = 8              # prompts shown to VLM per mining call
     n_proposals: int = 10               # attr proposals per VLM mining call
     n_proposer_calls: int = 1           # number of proposer VLM calls per EXPAND step
@@ -208,7 +218,14 @@ class BonAmplifiedConfig:
     p1_min: float = 0.1
     p1_max: float = 0.9
     detection_cache_path: str | None = None
+    # step 0 starts from this attribute pool (a JSON file OR a run's planner/ dir);
+    # planner + humanness + clustering are skipped (pool treated as already filtered).
+    initial_pool_path: str | None = None
     proposer_use_cluster_summary: bool = False  # include cluster summary in proposer prompt
+    # Restrict the proposer's avoid list to attrs rejected in the CURRENT run only;
+    # rejected attrs loaded from the detection cache (previous runs) are excluded from
+    # avoid. Cache save/load itself is unaffected (rejections keep accumulating).
+    proposer_avoid_current_run_only: bool = False
     use_per_prompt_ols: bool = False  # fit a separate OLS W_x per prompt (for residuals)
     # Monotonic pool + partial A_hat admission
     use_monotonic_pool: bool = False  # admit via partial_A_hat instead of A_hat; skip top-K
@@ -335,6 +352,14 @@ class SearchConfig:
         assert self.models.reward_model.name in ("imagereward", "pickscore", "hpsv3"), (
             f"models.reward_model.name must be 'imagereward', 'pickscore', or 'hpsv3', "
             f"got {self.models.reward_model.name!r}"
+        )
+        assert self.data.cluster_summary_field in ("summary", "category"), (
+            f"data.cluster_summary_field must be 'summary' or 'category', "
+            f"got {self.data.cluster_summary_field!r}"
+        )
+        assert self.bon_amplified.pplus_pminus_selection in ("extreme", "reward_matched", "random"), (
+            f"bon_amplified.pplus_pminus_selection must be 'extreme', 'reward_matched', or 'random', "
+            f"got {self.bon_amplified.pplus_pminus_selection!r}"
         )
         assert self.baseline_pairs.regression_model in ("lasso", "ridge", "elasticnet"), (
             f"baseline_pairs.regression_model must be 'lasso', 'ridge', or 'elasticnet', "

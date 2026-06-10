@@ -1,6 +1,7 @@
 """Initial attribute planner: generates visual attribute hypotheses from scored baseline images."""
 from __future__ import annotations
 import json
+from pathlib import Path
 from random import Random
 from typing import Any
 
@@ -17,7 +18,11 @@ from search.prompts.planning import (
     EDITABLE_LABEL, EDITABLE_DESC, EDITABLE_CHECK,
     MEASURABLE_LABEL, MEASURABLE_DESC, MEASURABLE_CHECK,
 )
-from search.utils.io import parse_json_response
+from search.utils.io import parse_json_response, save_json
+
+# Cluster-aware POST check string (embeds the cluster_summary value). Used in place of
+# the generic general_check_block when a cluster_summary is available.
+_CLUSTER_GENERAL_CHECK = "applies to ANY image in this cluster (**{cluster_summary}**)"
 
 
 def _score_label(raw: float, pool: list[float], norm: str) -> str:
@@ -37,17 +42,63 @@ def _score_label(raw: float, pool: list[float], norm: str) -> str:
         import statistics
         m = statistics.mean(pool)
         s = statistics.pstdev(pool) or 1.0
-        return f"Score (within-prompt z): {(raw - m) / s:+.2f}"
+        return f"Score: {(raw - m) / s:+.2f}"
     if norm == "minmax":
         lo, hi = min(pool), max(pool)
         rng = (hi - lo) or 1.0
-        return f"Score (within-prompt minmax): {(raw - lo) / rng:.2f}"
+        return f"Score: {(raw - lo) / rng:.2f}"
     if norm == "quantile":
         import bisect
         sorted_pool = sorted(pool)
         pct = bisect.bisect_right(sorted_pool, raw) / len(pool)
-        return f"Score (within-prompt rank %): {int(round(100 * pct))}"
+        return f"Score: {int(round(100 * pct))}"
     raise ValueError(f"Unknown score_normalization: {norm}")
+
+
+def _render_images_block(images: list[dict]) -> str:
+    """Render the per-call image list as text (one line per image).
+
+    Replaces the old literal "[images]" placeholder in the saved planner prompt
+    so it shows the real image path (+ group/score label) actually sent to the
+    model, e.g. `[Group 1] /path/to/img.png (Score: 0.83)`.
+    """
+    lines = []
+    for im in images:
+        grp = f"[Group {im['group']}] " if "group" in im else ""
+        lines.append(f"{grp}{im['image_path']} ({im['label']})")
+    return "\n".join(lines)
+
+
+def _render_planner_txt(rec: dict) -> str:
+    """Human-readable plain-text view of one planner call (keeps newlines intact)."""
+    pt = rec.get("prompt_text")
+    prompt_block = (
+        "\n".join(f"  - {p}" for p in pt) if isinstance(pt, list) else f"  {pt}"
+    )
+    pa = rec.get("parsed_attributes")
+    attr_block = (
+        "\n".join(f"  - {a}" for a in pa) if isinstance(pa, list) else f"  {pa}"
+    )
+    parts = [
+        f"operation={rec.get('operation')}  topic={rec.get('topic_id')}  "
+        f"step={rec.get('step_idx')}  call={rec.get('call_index')}",
+        f"planner_model={rec.get('planner_model')}  "
+        f"reasoning_effort={rec.get('reasoning_effort')}",
+        "",
+        "## prompt_text (user prompts shown to the planner)",
+        prompt_block,
+        "",
+        "## planner_prompt (full LLM input - includes image paths)",
+        rec.get("planner_prompt", ""),
+        "",
+        "## parsed_attributes (proposed)",
+        attr_block,
+    ]
+    if rec.get("reasoning"):
+        parts += ["", "## reasoning", str(rec["reasoning"])]
+    if rec.get("response_text"):
+        parts += ["", "## raw response_text", str(rec["response_text"])]
+    return "\n".join(parts) + "\n"
 
 
 class InitialPlanner:
@@ -71,6 +122,7 @@ class InitialPlanner:
         require_editable: bool = True,
         n_prompts_per_plan_call: int = 1,
         score_normalization: str = "none",
+        output_dir: "str | Path | None" = None,
         cache_config: CacheConfig | None = None,
     ):
         if score_normalization not in ("none", "zscore", "minmax", "quantile"):
@@ -94,6 +146,9 @@ class InitialPlanner:
         self.require_editable = require_editable
         self.n_prompts_per_plan_call = n_prompts_per_plan_call
         self.score_normalization = score_normalization
+        # Directory to write per-call planner JSONs into (already the `planner/`
+        # subdir; the caller passes config.run_output_dir() / "planner"). None = skip saving.
+        self.output_dir = Path(output_dir) if output_dir is not None else None
         self.caller = AutoCaller(dotenv_path=".env", cache_config=cache_config)
 
     async def plan(
@@ -164,7 +219,9 @@ class InitialPlanner:
                     f"      {topic_state.cluster_summary}\n"
                     "      </user_prompt_cluster_summary>"
                 )
-                general_check_block = "applies to ANY image in this cluster"
+                general_check_block = _CLUSTER_GENERAL_CHECK.format(
+                    cluster_summary=topic_state.cluster_summary
+                )
             else:
                 general_constraint_block = (
                     "the feature must be applicable to any image, "
@@ -191,9 +248,10 @@ class InitialPlanner:
                             bias_nudge=BIAS_NUDGE[self.direction],
                             editable_or_measurable_label=em_label,
                             editable_or_measurable_desc=em_desc,
-                        )
+                        ) + "\n\n"
                     )
                     content: list[dict] = [{"type": "input_text", "text": pre_text}]
+                    call_images: list[dict] = []
                     for g_idx, prompt_text in enumerate(chunk, 1):
                         baselines = topic_state.baselines.get(prompt_text, [])
                         scored = [b for b in baselines if reward_model_name in b.reward_scores]
@@ -224,17 +282,27 @@ class InitialPlanner:
                                 continue
                             content.append({"type": "input_image", "image_url": img_url, "detail": "auto"})
                             content.append({"type": "input_text", "text": label})
-                    post_text = LIST_PROMPT_POST_MULTI.format(
+                            call_images.append({
+                                "group": g_idx,
+                                "prompt_text": prompt_text,
+                                "image_id": baseline.image_id,
+                                "image_path": str(baseline.image_path),
+                                "score": baseline.reward_scores[reward_model_name],
+                                "label": label,
+                            })
+                    post_text = "\n\n" + LIST_PROMPT_POST_MULTI.format(
                         n_attrs_per_prompt=self.n_attrs_per_prompt,
                         bias_check=BIAS_CHECK[self.direction],
                         editable_or_measurable_check=em_check,
+                        general_check_block=general_check_block,
                     )
                     content.append({"type": "input_text", "text": post_text})
                     to_send.append(ChatHistory(messages=[ChatMessage(role="user", content=content)]))
                     metas.append({
                         "topic_id": topic_state.topic_id,
                         "prompt_text": chunk,
-                        "planner_prompt": pre_text + "[images]" + post_text,
+                        "images": call_images,
+                        "planner_prompt": pre_text + _render_images_block(call_images) + post_text,
                         "planner_model": self.model_name,
                         "reasoning_effort": str(self.reasoning),
                     })
@@ -272,6 +340,7 @@ class InitialPlanner:
                             + f"\n\nUser prompt: {prompt_text}\n"
                         )
                         content: list[dict] = [{"type": "input_text", "text": pre_text}]
+                        call_images: list[dict] = []
                         for baseline, label in zip(sampled, labels):
                             try:
                                 img_url = ChatMessage.image_to_base64_url(str(baseline.image_path))
@@ -280,6 +349,13 @@ class InitialPlanner:
                                 continue
                             content.append({"type": "input_image", "image_url": img_url, "detail": "auto"})
                             content.append({"type": "input_text", "text": label})
+                            call_images.append({
+                                "prompt_text": prompt_text,
+                                "image_id": baseline.image_id,
+                                "image_path": str(baseline.image_path),
+                                "score": baseline.reward_scores[reward_model_name],
+                                "label": label,
+                            })
                         post_text = LIST_PROMPT_POST.format(
                             n_attrs_per_prompt=self.n_attrs_per_prompt,
                             higher_lower=higher_lower,
@@ -293,7 +369,8 @@ class InitialPlanner:
                         metas.append({
                             "topic_id": topic_state.topic_id,
                             "prompt_text": prompt_text,
-                            "planner_prompt": pre_text + "[images]" + post_text,
+                            "images": call_images,
+                            "planner_prompt": pre_text + _render_images_block(call_images) + post_text,
                             "planner_model": self.model_name,
                             "reasoning_effort": str(self.reasoning),
                         })
@@ -316,11 +393,13 @@ class InitialPlanner:
         operation = "initial" if target_step_idx is None else "replan"
         desc = "initial attributes" if target_step_idx is None else "replan attributes"
         topic_state_by_id = {ts.topic_id: ts for ts in topic_states}
+        sidx = 0 if target_step_idx is None else target_step_idx
         for i, resp in enumerate(responses):
+            meta = metas[i]
+            attributes, reasoning = parse_json_response(resp) if resp is not None else (None, None)
+            self._save_planner_call(meta, i, operation, sidx, resp, attributes, reasoning)
             if resp is None:
                 continue
-            meta = metas[i]
-            attributes, reasoning = parse_json_response(resp)
             prompt_label = (
                 ", ".join(f'"{p[:40]}"' for p in meta["prompt_text"])
                 if isinstance(meta["prompt_text"], list)
@@ -336,7 +415,6 @@ class InitialPlanner:
                 logger.info(f"InitialPlanner: topic {meta['topic_id']} (index {i}) [{prompt_label}] proposed attributes: {attributes}")
 
             ts = topic_state_by_id[meta["topic_id"]]
-            sidx = 0 if target_step_idx is None else target_step_idx
             step = ts.history[sidx]
             for attr in attributes:
                 if attr not in step.attributes:
@@ -358,3 +436,39 @@ class InitialPlanner:
             sidx = 0 if target_step_idx is None else target_step_idx
             n = len(ts.history[sidx].attributes) if ts.history else 0
             logger.info(f"Topic {ts.topic_id}: {n} {desc} generated")
+
+    def _save_planner_call(
+        self,
+        meta: dict[str, Any],
+        call_index: int,
+        operation: str,
+        step_idx: int,
+        resp: Any,
+        parsed_attributes: Any,
+        reasoning: str | None,
+    ) -> None:
+        """Persist one InitialPlanner call (meta + trimmed response) as JSON into
+        self.output_dir (already the run's `planner/` subdir). No-op when unset."""
+        if self.output_dir is None:
+            return
+        record = {
+            "operation": operation,
+            "topic_id": meta["topic_id"],
+            "call_index": call_index,
+            "step_idx": step_idx,
+            "planner_model": meta["planner_model"],
+            "reasoning_effort": meta["reasoning_effort"],
+            "prompt_text": meta["prompt_text"],
+            "images": meta.get("images", []),
+            "planner_prompt": meta["planner_prompt"],
+            "response_text": resp.first_response if resp is not None else None,
+            "parsed_attributes": parsed_attributes,
+            "reasoning": reasoning,
+            "usage": resp.usage if resp is not None else None,
+        }
+        base = f"{operation}_step{step_idx}_topic{meta['topic_id']}_call{call_index:03d}"
+        save_json(record, self.output_dir / f"{base}.json")
+        # Also write a human-readable .txt that keeps the long planner_prompt's newlines
+        (self.output_dir / f"{base}.txt").write_text(
+            _render_planner_txt(record), encoding="utf-8"
+        )

@@ -1,0 +1,146 @@
+run:
+  name: null             # auto-generated
+  output_dir: "outputs/search/debug"
+  random_seed: 42
+
+pipeline:
+  mode: "bon_amplified"
+
+# ── DEBUG: same as bon_amplified_partial.yaml, smaller scale for a fast run ──
+# Models/detector (Qwen vLLM) unchanged; steps/images/prompts reduced.
+bon_amplified:
+  N: 2                       # BoN parameter for U^{N-1} quantile
+  tau: 0.0                    # A_hat pruning threshold
+  n_top_residual: 4           # P+/P- images extracted per prompt (debug: 4→2)
+  # P+/P- selection within sign-split pools: "extreme"(default) | "reward_matched" | "random"
+  pplus_pminus_selection: "reward_matched"
+  pplus_pminus_reward_tol: null   # max |reward diff| for reward_matched (null = no cap)
+  n_prompts_vlm: 8            # prompts shown to VLM per mining call (debug: 8→4)
+  n_proposals: 10              # attr proposals per VLM mining call (debug: 10→4)
+  n_proposer_calls: 1         # proposer VLM calls per EXPAND step (debug: 2→1)
+  proposer_use_cluster_summary: true
+  proposer_avoid_current_run_only: true
+  use_per_prompt_ols: true
+  use_monotonic_pool: true
+  tau_partial: 0.0
+  n_admit_per_step: 4         # max admissions per EXPAND (debug: 4→2)
+  prompt_select_strategy: "random"
+  prompt_select_exclude_pct: 0.2
+  select_all_passing: false
+  use_p1_filter: true
+  p1_min: 0.1
+  p1_max: 0.9
+  # debug-only cache path (avoids polluting the real cache); starts fresh if absent
+  detection_cache_path: outputs/detection_cache/debug/sd2-community-stable-diffusion-2-1_applicability.json
+  # Start step 0 from a saved pool (a JSON file or a run's planner/ dir); when set,
+  # planner + humanness + clustering are skipped. Uncomment to enable.
+  initial_pool_path: outputs/search/debug/20260608-141605/planner
+
+data:
+  # baseline_manifest: "/nfs/data/sohyun/projects/t2i-rm-bias/data/baselines/mjhq/topic_0/black-forest-labs-FLUX.1-dev/manifest.json"
+  baseline_manifest: "/nfs/data/sohyun/projects/t2i-rm-bias/data/baselines/mjhq_10tok/100prompt/topic_0/sd2-community-stable-diffusion-2-1/manifest.json"
+  baseline_root: ""
+  # prompts_dir: "clustering/output/mjhq"
+  prompts_dir: "clustering/output/mjhq_10tok/100prompt"
+  topic_ids: [0]
+  val_split_size: 50
+  cluster_summary_field: "category"
+
+models:
+  reward_model:
+    name: "pickscore"
+    device: "cuda:0"
+    hf_cache_dir: "/nfs/data/sohyun/models"
+
+  detector:
+    model: "Qwen/Qwen3.5-9B"
+    max_tokens: 1024
+    max_parallel: 32
+    image_detail: "auto"
+    use_batch_api: false
+    vllm_base_url: http://localhost:8000/v1
+    temperature: 0.7
+    top_p: 0.8
+    presence_penalty: 1.5
+    extra_body:
+      top_k: 20
+      chat_template_kwargs:
+        enable_thinking: false
+    use_prompt: false
+    use_reasoning: false
+    use_applicability: true
+    not_applicable_as_absent: true
+
+  planner:
+    model: "openai/gpt-5.2"
+    reasoning: "high"
+    max_tokens: 50000
+    max_parallel: 64
+
+  attr_filter:
+    model: "openai/gpt-5.2"
+    max_tokens: 128
+    max_parallel: 64
+
+  proposer:
+    model: "openai/gpt-5.2"
+    reasoning: "high"
+    max_tokens: 50000
+    max_parallel: 64
+    image_detail: "auto"
+
+  cluster:
+    model: "openai/gpt-5.2"
+    max_tokens: 10000
+    reasoning: "high"
+    max_parallel: 1
+
+  # editor/judge: unused by bon_amplified, kept to satisfy SearchConfig defaults
+  editor:
+    instruction_model: "openai/gpt-4o-mini"
+    flux_model: "black-forest-labs/FLUX.1-Kontext-dev"
+    flux_devices: ["cuda:0"]
+    guidance_scale: 2.5
+  judge:
+    model: "openai/gpt-4o-mini"
+    max_tokens: 10000
+    max_parallel: 32
+    image_detail: "low"
+    use_batch_api: false
+
+evolution:
+  n_steps: 2                  # debug: 20→2 (1-2 EXPAND iterations only)
+  initial_pop_size: 4        # clustering cap = initial_pop_size × 2 = 4
+  target_pop_sizes: [4, 4]    # length == n_steps (validate)
+  n_context_imgs: 8           # debug: 8→4
+  n_attrs_per_prompt: 8       # debug: 8→4
+  n_per_user_prompt: 1
+  n_initial_plan_prompts: 32   # train prompts shown to InitialPlanner (chunked by n_prompts_per_plan_call)
+  n_prompts_per_plan_call: 4
+  initial_context_sampling: "random" # "stratified" | "random"
+  use_cluster_summary: true
+  direction: "plus"
+  image_order: "descending"
+  initial_score_normalization: "quantile"
+
+evaluation:
+  train_batch_size: [32, 32]  # length == n_steps (validate)
+  amp_n_prompts: 32            # number of fixed-baseline prompts (debug: 100→4)
+  amp_n_images_per_prompt: 32  # images per prompt (detection ≈ amp_n_prompts × this)
+
+# unused by bon_amplified, kept to satisfy validate()
+baseline_pairs:
+  pair_constructor: stratified
+  judge_filter_position: "lazy"
+  regression_model: ridge
+
+caller_cache:
+  enabled: false
+  base_path: ".cache/caller"
+  max_entries_in_disk: 131072
+
+logging:
+  wandb:
+    enabled: false            # debug: wandb off
+  log_images_every_n_steps: 1
+  console_level: "INFO"

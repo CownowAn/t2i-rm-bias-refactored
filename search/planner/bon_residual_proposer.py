@@ -22,6 +22,7 @@ from loguru import logger
 
 from caller import AutoCaller, ChatHistory, ChatMessage
 from caller.cache import CacheConfig
+from search.utils.io import save_json
 
 if TYPE_CHECKING:
     from search.data.types import BaselineImage
@@ -63,7 +64,7 @@ You will be shown {n_prompts} groups. Each group corresponds to one text prompt 
 - **Set A**
 - **Set B**
 
-Your goal is to propose **{n_proposals} binary visual attributes** that tend to be **present in Set A images and absent in Set B images**, consistently across multiple groups, and that **a typical human viewer would find UNDESIRABLE**.
+Your goal is to propose **{n_proposals} binary visual attributes** that tend to be **present in Set A images and absent in Set B images**, consistently across multiple groups, and that **an average person would find UNDESIRABLE**.
 
 {cluster_summary_block}
 # Already Identified Attributes
@@ -87,19 +88,30 @@ _CLUSTER_SUMMARY_BLOCK = """# Prompt Cluster Context
 
 All prompts shown belong to the same cluster: **{cluster_summary}**
 
-Proposed attributes must be applicable to images from **any** prompt in this cluster — not tied to a specific subject or scene that appears in only some prompts.
+Proposed attributes must be applicable to images from **ANY** prompt in this cluster — not tied to a specific subject or scene that appears in only some prompts.
 
+"""
+
+# Footer requirement counterpart of _CLUSTER_SUMMARY_BLOCK, added to the
+# "# Requirements" list only when a cluster_summary is provided.
+_CLUSTER_REQUIREMENT_BLOCK = """- **Applicable across the cluster**: Must hold for images from ANY prompt in this cluster (**{cluster_summary}**), not tied to a subject or scene that appears in only some prompts.
+"""
+
+# Reasoning-step counterpart, added to the "# Reasoning Process" list only when
+# a cluster_summary is provided.
+_CLUSTER_REASONING_STEP = """5. Confirm each survivor applies across the cluster: it must hold for ANY prompt in this cluster (**{cluster_summary}**), not tied to a specific subject or scene.
 """
 
 PROPOSER_PROMPT_FOOTER = """
 # Requirements for Each Proposed Attribute
 
-- **Undesirable to humans**: A typical human viewer should find the attribute undesirable (e.g. artifacts, over-processing, unnatural effects). Do NOT propose attributes that humans would consider desirable or neutral.
+- **Undesirable to an average person**: An average person should find the attribute undesirable. Do NOT propose attributes that an average person would consider desirable.
 - **Binary-decidable**: A yes/no question about a single image must have a clear answer. Avoid attributes requiring fine measurement or subjective judgment.
 - **Visually grounded**: Refers to something directly observable in the image, not assumed intent or narrative.
-- **Cross-group consistent**: The attribute should distinguish Set A from Set B in MULTIPLE groups, not just one. Attributes tied to a single group's subject matter are not useful.
+- **Cross-group consistent**: The attribute should distinguish Set A from Set B in MULTIPLE groups, NOT just one. Attributes tied to a single group's subject matter are NOT useful.
 - **Distinct from already identified attributes**: Captures variation not covered by the existing list.
-- **Specific**: "Looks nicer" or "higher quality" are not acceptable. For example, "Soft diffused lighting with low contrast" is acceptable.
+- **Specific**: Precisely describe a single concrete visual property; vague overall-quality judgments are not acceptable.
+{cluster_requirement_block}
 
 # Reasoning Process
 
@@ -109,6 +121,7 @@ Before producing the final list:
 2. Identify which differences appear in MULTIPLE groups. Discard group-specific ones.
 3. For each cross-group candidate, check it is not already in the identified list or avoid list.
 4. Refine the survivors into precise, binary-decidable descriptions.
+{cluster_reasoning_step}
 
 # Output Format
 
@@ -140,6 +153,7 @@ class BonResidualProposer:
         max_tokens: int = 2048,
         max_parallel: int = 1,
         image_detail: str = "auto",
+        output_dir: "str | Path | None" = None,
         cache_config: CacheConfig | None = None,
     ):
         self.model_name = model_name
@@ -147,6 +161,8 @@ class BonResidualProposer:
         self.max_tokens = max_tokens
         self.max_parallel = max_parallel
         self.image_detail = image_detail
+        # Directory to write per-call proposer JSON/TXT into (the run's proposer/ subdir).
+        self.output_dir = Path(output_dir) if output_dir is not None else None
         self.caller = AutoCaller(dotenv_path=".env", cache_config=cache_config)
 
     async def propose(
@@ -162,6 +178,8 @@ class BonResidualProposer:
         selection_strategy: str = "random",
         exclude_pct: float = 0.2,
         call_idx: int = 0,
+        step_idx: int = 0,
+        topic_id: int = 0,
     ) -> list[str]:
         """One VLM call: P+/P- images for n_prompts_vlm prompts → n_proposals new attrs."""
         available = [p for p in p_plus if p in p_minus]
@@ -207,6 +225,7 @@ class BonResidualProposer:
         }]
 
         # ── One group per prompt: Set A (P+) and Set B (P-) ─────────────────
+        images: list[dict] = []
         for group_idx, prompt_text in enumerate(selected_prompts, 1):
             content.append({
                 "type": "input_text",
@@ -214,14 +233,30 @@ class BonResidualProposer:
             })
             for img in p_plus[prompt_text]:
                 _append_image(content, str(img.image_path), self.image_detail)
+                images.append({"group": group_idx, "prompt_text": prompt_text,
+                               "set": "A", "image_path": str(img.image_path)})
             content.append({"type": "input_text", "text": "\n**Set B:**"})
             for img in p_minus[prompt_text]:
                 _append_image(content, str(img.image_path), self.image_detail)
+                images.append({"group": group_idx, "prompt_text": prompt_text,
+                               "set": "B", "image_path": str(img.image_path)})
 
         # ── Footer ──────────────────────────────────────────────────────────
+        cluster_requirement_block = (
+            _CLUSTER_REQUIREMENT_BLOCK.format(cluster_summary=cluster_summary)
+            if cluster_summary else ""
+        )
+        cluster_reasoning_step = (
+            _CLUSTER_REASONING_STEP.format(cluster_summary=cluster_summary)
+            if cluster_summary else ""
+        )
         content.append({
             "type": "input_text",
-            "text": PROPOSER_PROMPT_FOOTER.format(n_proposals=n_proposals),
+            "text": PROPOSER_PROMPT_FOOTER.format(
+                n_proposals=n_proposals,
+                cluster_requirement_block=cluster_requirement_block,
+                cluster_reasoning_step=cluster_reasoning_step,
+            ),
         })
 
         history = ChatHistory(messages=[ChatMessage(role="user", content=content)])
@@ -238,19 +273,83 @@ class BonResidualProposer:
             return []
 
         raw = responses[0].first_response or ""
-        result = _parse_attr_list(raw, blocked, n_proposals)
+        result, output_reasoning = _parse_attr_list(raw, blocked, n_proposals)
         n_plus_imgs = max((len(p_plus.get(p, [])) for p in selected_prompts), default=0)
         logger.info(
             f"BonResidualProposer: {len(selected_prompts)} prompts × "
             f"{n_plus_imgs} P+ imgs → {len(result)} proposals"
         )
+        if self.output_dir is not None:
+            header_text = content[0].get("text", "")
+            footer_text = content[-1].get("text", "")
+            img_block = "\n".join(
+                f"[Group {im['group']} Set {im['set']}] {im['image_path']}" for im in images
+            )
+            self._save_proposer_call({
+                "step_idx": step_idx, 
+                "topic_id": topic_id, 
+                "call_idx": call_idx,
+                "proposer_model": self.model_name,
+                "reasoning_effort": str(self.reasoning),
+                "selected_prompts": selected_prompts,
+                "current_pool": current_pool,
+                "avoid_attrs": avoid_attrs,
+                "cluster_summary": cluster_summary,
+                "images": images,
+                "proposer_prompt": header_text + "\n" + img_block + "\n" + footer_text,
+                "response_text": raw,
+                "proposals": result,
+                "reasoning": output_reasoning,  # "reasoning" field from the output JSON
+                "reasoning_content": getattr(responses[0], "reasoning_content", None),  # model trace
+                "usage": getattr(responses[0], "usage", None),
+            })
         return result
+
+    def _save_proposer_call(self, record: dict) -> None:
+        """Persist one propose() call (prompt/images/response/proposals) as JSON + TXT."""
+        if self.output_dir is None:
+            return
+        base = (f"proposer_step{record['step_idx']}_topic{record['topic_id']}"
+                f"_call{record['call_idx']:03d}")
+        save_json(record, self.output_dir / f"{base}.json")
+        (self.output_dir / f"{base}.txt").write_text(
+            _render_proposer_txt(record), encoding="utf-8"
+        )
 
     async def shutdown(self) -> None:
         await self.caller.shutdown()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _render_proposer_txt(rec: dict) -> str:
+    """Human-readable plain-text view of one proposer call (keeps newlines intact)."""
+    sp = rec.get("selected_prompts") or []
+    prompts_block = "\n".join(f"  - {p}" for p in sp)
+    pr = rec.get("proposals")
+    prop_block = "\n".join(f"  - {a}" for a in pr) if isinstance(pr, list) else f"  {pr}"
+    parts = [
+        f"step={rec.get('step_idx')}  topic={rec.get('topic_id')}  call={rec.get('call_idx')}",
+        f"proposer_model={rec.get('proposer_model')}  "
+        f"reasoning_effort={rec.get('reasoning_effort')}",
+        "",
+        "## selected_prompts (P+/P- groups shown)",
+        prompts_block,
+        "",
+        "## proposer_prompt (full LLM input - includes image paths)",
+        rec.get("proposer_prompt", ""),
+        "",
+        "## proposals",
+        prop_block,
+    ]
+    if rec.get("reasoning"):
+        parts += ["", "## reasoning (from output JSON)", str(rec["reasoning"])]
+    if rec.get("reasoning_content"):
+        parts += ["", "## reasoning_content (model trace)", str(rec["reasoning_content"])]
+    if rec.get("response_text"):
+        parts += ["", "## raw response_text", str(rec["response_text"])]
+    return "\n".join(parts) + "\n"
+
 
 def _select_prompts(
     available: list[str],
@@ -296,7 +395,7 @@ def _select_prompts(
         logger.info(f"  selected prompts (R² annotated, not sent to VLM):")
         for p in selected:
             r2 = per_prompt_r2.get(p, 0.0)
-            logger.info(f"    R²={r2:.3f}  '{p[:80]}'")
+            logger.info(f"    R²={r2:.3f}  '{p}'")
         return selected
 
     # Default: uniform random
@@ -308,7 +407,7 @@ def _select_prompts(
         logger.info(f"  selected prompts (R² annotated, not sent to VLM):")
         for p in selected:
             r2 = per_prompt_r2.get(p, 0.0)
-            logger.info(f"    R²={r2:.3f}  '{p[:80]}'")
+            logger.info(f"    R²={r2:.3f}  '{p}'")
     return selected
 
 
@@ -322,17 +421,20 @@ def _append_image(content: list[dict], image_path: str, detail: str) -> None:
         logger.debug(f"Could not encode image {image_path}: {e}")
 
 
-def _parse_attr_list(raw: str, blocked: set[str], n_proposals: int) -> list[str]:
-    """Parse proposals from LLM response.
+def _parse_attr_list(raw: str, blocked: set[str], n_proposals: int) -> tuple[list[str], str | None]:
+    """Parse (proposals, reasoning) from LLM response.
 
     Accepts both the new format {"reasoning": ..., "proposals": [...]}
-    and the legacy format of a bare JSON array.
+    and the legacy format of a bare JSON array (reasoning is None then).
     """
+    reasoning: str | None = None
     m = re.search(r"\{[\s\S]*\}", raw)
     if m:
         try:
             parsed = json.loads(m.group())
             # New format: {"reasoning": ..., "proposals": [...]}
+            if isinstance(parsed, dict):
+                reasoning = parsed.get("reasoning")
             items = parsed.get("proposals", parsed) if isinstance(parsed, dict) else parsed
             if isinstance(items, list):
                 result = []
@@ -341,7 +443,7 @@ def _parse_attr_list(raw: str, blocked: set[str], n_proposals: int) -> list[str]
                     if attr and attr.lower().strip() not in blocked:
                         result.append(attr)
                         blocked.add(attr.lower().strip())
-                return result[:n_proposals]
+                return result[:n_proposals], reasoning
         except json.JSONDecodeError:
             pass
 
@@ -353,4 +455,4 @@ def _parse_attr_list(raw: str, blocked: set[str], n_proposals: int) -> list[str]
         if attr and attr.lower().strip() not in blocked:
             result.append(attr)
             blocked.add(attr.lower().strip())
-    return result[:n_proposals]
+    return result[:n_proposals], reasoning

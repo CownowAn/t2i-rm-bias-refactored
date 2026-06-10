@@ -106,6 +106,7 @@ def reconstruct_run_data(
         topic_ids=[topic_id],
         val_split_size=config.data.val_split_size,
         random_seed=config.run.random_seed,
+        summary_field=config.data.cluster_summary_field,
     )
     ts = states[0]
     load_baselines_from_manifest(ts, config.data.baseline_manifest, config.data.baseline_root)
